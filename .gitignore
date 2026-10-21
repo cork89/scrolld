@@ -1,2 +1,4 @@
 bin
 windows/*.lib
+windows/libwebp/
+windows/libwebp.zip

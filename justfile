@@ -8,16 +8,24 @@ build: deps
 run *args: build
     ./bin/scrolld{{exe}} {{args}}
 
-# Installs webp and libheif from MSYS2, generates their import libraries, and
-# copies every DLL the exe loads (raylib's from Odin, the rest from MSYS2) into bin/.
+webp_version := "1.6.0"
+webp_sha256 := "48886f506b21f62e4661f0f4cbfca19800897c385128e8902542d29a950c93f1"
+
+# Downloads Google's static libwebp into windows/libwebp/ (skipped once it's
+# there), generates libheif's import library, and copies the two DLLs the exe
+# loads into bin/: raylib's from Odin and the committed windows/libheif.dll.
 [windows]
 deps:
-    {{msys}}/usr/bin/bash -lc "pacman -S --needed --noconfirm mingw-w64-ucrt-x86_64-libwebp mingw-w64-ucrt-x86_64-libheif"
-    zig dlltool -m i386:x86-64 -d windows/webp.def -l windows/webp.lib
-    zig dlltool -m i386:x86-64 -d windows/heif.def -l windows/heif.lib
+    [ -f windows/libwebp/lib/libwebp.lib ] || { curl -sfL -o windows/libwebp.zip https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-{{webp_version}}-windows-x64.zip && echo "{{webp_sha256}} *windows/libwebp.zip" | sha256sum -c - && unzip -q windows/libwebp.zip -d windows && mv windows/libwebp-{{webp_version}}-windows-x64 windows/libwebp && rm windows/libwebp.zip; }
+    "$(odin root)/bin/lld-link.exe" -lib -machine:x64 -def:windows/heif.def -out:windows/heif.lib
     mkdir -p bin
-    cp "$(odin root)/vendor/raylib/windows/raylib.dll" bin/
-    { echo /ucrt64/bin/libwebp-7.dll; echo /ucrt64/bin/libheif.dll; {{msys}}/usr/bin/bash -lc "ldd /ucrt64/bin/libwebp-7.dll /ucrt64/bin/libheif.dll"; } | grep -o '/ucrt64/bin/[^ ]*\.dll' | while read -r dll; do cp "{{msys}}$dll" bin/ || exit 1; done
+    cp "$(odin root)/vendor/raylib/windows/raylib.dll" windows/libheif.dll bin/
+
+# Rebuilds windows/libheif.dll from source with MSYS2; only needed to change
+# libheif's version or codecs.
+[windows]
+libheif:
+    {{msys}}/usr/bin/bash -lc "cd '{{justfile_directory()}}' && bash windows/build-libheif.sh"
 
 [unix]
 deps:

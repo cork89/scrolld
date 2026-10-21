@@ -32,8 +32,8 @@ import stbi "vendor:stb/image"
 import clay "clay-odin"
 
 // Requires Homebrew's raylib, webp and libheif packages on macOS. On Windows,
-// raylib comes with Odin and webp and libheif come from MSYS2's UCRT64 packages,
-// linked through the import libraries `just deps` generates in windows/.
+// raylib comes with Odin, webp is Google's static build fetched by `just deps`,
+// and libheif is windows/libheif.dll, built HEVC-decode-only by `just libheif`.
 //
 // raylib's own copy of stb_image is built without JPEG support, and linking it
 // statically clashes with vendor:stb/image. Linking raylib as a dylib keeps its
@@ -42,7 +42,7 @@ import clay "clay-odin"
 
 // WebP comes from Homebrew's libwebp (`brew install webp`).
 when ODIN_OS == .Windows {
-	foreign import webp "windows/webp.lib"
+	foreign import webp "windows/libwebp/lib/libwebp.lib"
 } else {
 	@(extra_linker_flags = "-L/opt/homebrew/opt/webp/lib")
 	foreign import webp "system:webp"
