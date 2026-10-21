@@ -1,6 +1,6 @@
 // scrolld: an auto-scrolling masonry wall of the images in a directory.
 //
-// Build:  just build   (odin build scrolld.odin -file -define:RAYLIB_SHARED=true -o:speed -out:bin/scrolld)
+// Build:  just build   (odin build . -define:RAYLIB_SHARED=true -o:speed -out:bin/scrolld)
 // Run:    ./bin/scrolld [dir] [-r] [-s] [-x]
 //
 // The grid is drawn directly with raylib; Clay lays out the top bar and the
@@ -14,7 +14,6 @@
 // ~/.scrolld/settings whenever they change, and loaded on the next launch.
 package main
 
-import "base:intrinsics"
 import "base:runtime"
 import "core:c"
 import "core:c/libc"
@@ -27,13 +26,14 @@ import "core:strconv"
 import "core:strings"
 import "core:sync"
 import "core:thread"
-import NS "core:sys/darwin/Foundation"
 import rl "vendor:raylib"
 import rlgl "vendor:raylib/rlgl"
 import stbi "vendor:stb/image"
 import clay "clay-odin"
 
-// Requires Homebrew's raylib, webp and libheif packages.
+// Requires Homebrew's raylib, webp and libheif packages on macOS. On Windows,
+// raylib comes with Odin and webp and libheif come from MSYS2's UCRT64 packages,
+// linked through the import libraries `just deps` generates in windows/.
 //
 // raylib's own copy of stb_image is built without JPEG support, and linking it
 // statically clashes with vendor:stb/image. Linking raylib as a dylib keeps its
@@ -41,8 +41,12 @@ import clay "clay-odin"
 #assert(rl.RAYLIB_SHARED, "build with -define:RAYLIB_SHARED=true")
 
 // WebP comes from Homebrew's libwebp (`brew install webp`).
-@(extra_linker_flags = "-L/opt/homebrew/opt/webp/lib")
-foreign import webp "system:webp"
+when ODIN_OS == .Windows {
+	foreign import webp "windows/webp.lib"
+} else {
+	@(extra_linker_flags = "-L/opt/homebrew/opt/webp/lib")
+	foreign import webp "system:webp"
+}
 
 WEBP_DECODER_ABI_VERSION :: 0x0210
 WEBP_STATUS_NOT_ENOUGH_DATA :: 7
@@ -59,8 +63,12 @@ foreign webp {
 }
 
 // HEIC/HEIF comes from Homebrew's libheif (`brew install libheif`).
-@(extra_linker_flags = "-L/opt/homebrew/opt/libheif/lib")
-foreign import heif "system:heif"
+when ODIN_OS == .Windows {
+	foreign import heif "windows/heif.lib"
+} else {
+	@(extra_linker_flags = "-L/opt/homebrew/opt/libheif/lib")
+	foreign import heif "system:heif"
+}
 
 HEIF_COLORSPACE_RGB :: 1
 HEIF_CHROMA_INTERLEAVED_RGBA :: 11
@@ -286,7 +294,7 @@ Settings :: struct {
 	fullscreen:   bool,
 }
 
-settings_dir: string // "" when $HOME isn't set: nothing is loaded or saved
+settings_dir: string // "" when $HOME (%USERPROFILE% on Windows) isn't set: nothing is loaded or saved
 settings_path: string
 
 pics: [dynamic]Picture
@@ -366,7 +374,7 @@ main :: proc() {
 	rl.SetExitKey(.KEY_NULL)
 	if fullscreen do set_fullscreen(true)
 
-	ui_font = rl.LoadFontEx("/System/Library/Fonts/Supplemental/Arial.ttf", 48, nil, 0)
+	ui_font = rl.LoadFontEx(ODIN_OS == .Windows ? "C:/Windows/Fonts/arial.ttf" : "/System/Library/Fonts/Supplemental/Arial.ttf", 48, nil, 0)
 	rl.SetTextureFilter(ui_font.texture, .BILINEAR)
 
 	tile_shader = rl.LoadShaderFromMemory(nil, TILE_FS)
@@ -511,7 +519,7 @@ load_settings :: proc() -> Settings {
 	}
 
 	defer free_all(context.temp_allocator)
-	home := os.get_env("HOME", context.temp_allocator)
+	home := os.get_env(ODIN_OS == .Windows ? "USERPROFILE" : "HOME", context.temp_allocator)
 	if home == "" do return current_settings()
 	settings_dir = strings.concatenate({home, "/.scrolld"})
 	settings_path = strings.concatenate({settings_dir, "/settings"})
@@ -1031,17 +1039,6 @@ handle_keys :: proc(view_len: f64) {
 		if pressed(.PAGE_DOWN) do scroll += view_len * 0.9
 		if pressed(.PAGE_UP) do scroll -= view_len * 0.9
 	}
-}
-
-// Fullscreen is macOS's own (its own Space, with the animation), toggled on
-// the NSWindow that raylib's GLFW backend hands back as the window handle.
-is_fullscreen :: proc() -> bool {
-	mask := intrinsics.objc_send(NS.WindowStyleMask, (^NS.Window)(rl.GetWindowHandle()), "styleMask")
-	return .FullScreen in mask
-}
-
-set_fullscreen :: proc(on: bool) {
-	if is_fullscreen() != on do NS.Window_toggleFullScreen((^NS.Window)(rl.GetWindowHandle()), nil)
 }
 
 change_speed :: proc(delta: f64) {

@@ -1,0 +1,6 @@
+; Exports of MSYS2's libwebp that scrolld calls, for `just deps` to turn
+; into the import library windows/webp.lib.
+LIBRARY libwebp-7.dll
+EXPORTS
+WebPGetFeaturesInternal
+WebPDecodeRGBA

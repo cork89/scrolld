@@ -1,0 +1,17 @@
+; Exports of MSYS2's libheif that scrolld calls, for `just deps` to turn
+; into the import library windows/heif.lib.
+LIBRARY libheif.dll
+EXPORTS
+heif_init
+heif_context_alloc
+heif_context_free
+heif_context_read_from_file
+heif_context_get_primary_image_handle
+heif_image_handle_get_width
+heif_image_handle_get_height
+heif_image_handle_release
+heif_decode_image
+heif_image_get_width
+heif_image_get_height
+heif_image_get_plane_readonly2
+heif_image_release
