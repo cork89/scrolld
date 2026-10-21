@@ -185,7 +185,9 @@ void main() {
 	finalColor = vec4(c.rgb, c.a * clamp(0.5 - d, 0.0, 1.0));
 }`
 
-IMAGE_EXTS := [?]string{".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".heif"}
+ICON_PNG :: #load("icon.png") // icon.svg rendered at 256 px
+
+IMAGE_EXTS :=[?]string{".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".heif"}
 
 BG :: rl.Color{15, 15, 18, 255}
 TILE_BG :: rl.Color{34, 34, 42, 255}
@@ -373,6 +375,13 @@ main :: proc() {
 	defer rl.CloseWindow()
 	rl.SetExitKey(.KEY_NULL)
 	if fullscreen do set_fullscreen(true)
+
+	// macOS windows have no icon of their own; there it comes from an app bundle.
+	when ODIN_OS != .Darwin {
+		icon := rl.LoadImageFromMemory(".png", raw_data(ICON_PNG), c.int(len(ICON_PNG)))
+		rl.SetWindowIcon(icon)
+		rl.UnloadImage(icon)
+	}
 
 	ui_font = rl.LoadFontEx(ODIN_OS == .Windows ? "C:/Windows/Fonts/arial.ttf" : "/System/Library/Fonts/Supplemental/Arial.ttf", 48, nil, 0)
 	rl.SetTextureFilter(ui_font.texture, .BILINEAR)

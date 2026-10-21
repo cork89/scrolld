@@ -1,9 +1,10 @@
 exe := if os_family() == "windows" { ".exe" } else { "" }
+resource := if os_family() == "windows" { "-resource:windows/scrolld.res" } else { "" }
 msys := env("MSYS2_ROOT", "C:/msys64")
 
 build: deps
     mkdir -p bin
-    odin build . -define:RAYLIB_SHARED=true -o:speed -out:bin/scrolld{{exe}}
+    odin build . -define:RAYLIB_SHARED=true -o:speed -out:bin/scrolld{{exe}} {{resource}}
 
 run *args: build
     ./bin/scrolld{{exe}} {{args}}
