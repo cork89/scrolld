@@ -18,6 +18,15 @@ web dir:
     cp web/index.html web/raylib.js web/scrolld.js icon.png "$(odin root)/core/sys/wasm/js/odin.js" bin/web/
     odin run web/manifest -- "{{dir}}" bin/web/images
 
+# Builds the web version and force-pushes it, as a single commit, to the
+# gh-pages branch, which GitHub Pages serves (Settings > Pages > Deploy from a
+# branch: gh-pages, root).
+pages dir: (web dir)
+    touch bin/web/.nojekyll
+    rm -rf bin/web/.git
+    cd bin/web && git init -q -b gh-pages && git add -A && git commit -q -m "Deploy web demo" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" && git push -f "$(git -C ../.. remote get-url origin)" gh-pages
+    rm -rf bin/web/.git
+
 webp_version := "1.6.0"
 webp_sha256 := "48886f506b21f62e4661f0f4cbfca19800897c385128e8902542d29a950c93f1"
 
