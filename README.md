@@ -1,5 +1,7 @@
 # scrolld
 
+- a command line utility to auto scroll your image library
+
 ## Quick start
 
 ### macOS
