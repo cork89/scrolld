@@ -5,8 +5,8 @@
 //
 // The grid is drawn directly with raylib; Clay lays out the top bar and the
 // full-size viewer. The wall scrolls down in columns, right in rows (sideways),
-// or away into the distance (crawl: the column grid is rendered to a texture
-// drawn on a tilted 3D plane). Images are decoded and shrunk to lane size on worker
+// or away into the distance (crawl: the column grid is drawn on a tilted 3D
+// plane, wide enough to fill the screen). Images are decoded and shrunk to lane size on worker
 // threads, uploaded to the GPU a few per frame, and unloaded once they're well
 // off screen, so memory stays flat no matter how long it scrolls.
 //
@@ -144,29 +144,49 @@ CRAWL_UNIT :: 0.01
 CRAWL_FOVY :: 45.0
 CRAWL_TILT :: 62.0 // degrees back from facing the camera
 CRAWL_SCREENS :: 5.0 // plane length, in screen heights
-CRAWL_MAX_TEX :: 8192 // render texture height cap, physical pixels
 
-// Fades the far end of the crawl plane into the background.
-CRAWL_FS :: `#version 330
+// raylib's default vertex shader, plus how far along the crawl plane each
+// vertex is (0 at the near edge, 1 at the far end) for the fade. rlgl applies
+// the plane's transform on the CPU, so vertexPosition is already in world space.
+GRID_VS :: `#version 330
+in vec3 vertexPosition;
+in vec2 vertexTexCoord;
+in vec4 vertexColor;
+uniform mat4 mvp;
+uniform float fadeDepth; // world depth of the far end, 0 = no fade
+out vec2 fragTexCoord;
+out vec4 fragColor;
+out float fragFar;
+
+void main() {
+	fragTexCoord = vertexTexCoord;
+	fragColor = vertexColor;
+	fragFar = fadeDepth > 0.0 ? -vertexPosition.z / fadeDepth : 0.0;
+	gl_Position = mvp * vec4(vertexPosition, 1.0);
+}`
+
+// Placeholders: fades the far end of the crawl plane into the background.
+FADE_FS :: `#version 330
 in vec2 fragTexCoord;
 in vec4 fragColor;
+in float fragFar;
 uniform sampler2D texture0;
 uniform vec4 colDiffuse;
-uniform float toward; // 1 when the texture's v=1 edge is nearest
 out vec4 finalColor;
 
 void main() {
-	float far = toward > 0.5 ? 1.0 - fragTexCoord.y : fragTexCoord.y;
 	vec4 c = texture(texture0, fragTexCoord) * colDiffuse * fragColor;
-	finalColor = vec4(c.rgb, c.a * (1.0 - smoothstep(0.55, 1.0, far)));
+	finalColor = vec4(c.rgb, c.a * (1.0 - smoothstep(0.55, 1.0, fragFar)));
 }`
 
 // Rounds a tile's corners with an antialiased rounded-rect distance field, and
 // darkens its bottom edge behind the hover caption so that stays inside the
-// corners too.
+// corners too. The edge is antialiased over one screen pixel, however small
+// the tile is drawn, and fades like FADE_FS in crawl mode.
 TILE_FS :: `#version 330
 in vec2 fragTexCoord;
 in vec4 fragColor;
+in float fragFar;
 uniform sampler2D texture0;
 uniform vec4 colDiffuse;
 uniform vec2 size;     // tile size in physical pixels
@@ -182,7 +202,9 @@ void main() {
 	if (caption > 0.0) {
 		c.rgb *= 1.0 - 0.7 * clamp((p.y - (size.y - caption)) / caption, 0.0, 1.0);
 	}
-	finalColor = vec4(c.rgb, c.a * clamp(0.5 - d, 0.0, 1.0));
+	float aa = max(length(vec2(dFdx(d), dFdy(d))), 1e-4);
+	float fade = 1.0 - smoothstep(0.55, 1.0, fragFar);
+	finalColor = vec4(c.rgb, c.a * fade * clamp(0.5 - d / aa, 0.0, 1.0));
 }`
 
 ICON_PNG :: #load("icon.png") // icon.svg rendered at 256 px
@@ -312,7 +334,8 @@ thumb_sideways: bool
 mode: Mode
 sideways := false // mode == .Sideways, kept as a flag since the layout code checks it everywhere
 lanes_setting := 0 // 0 = auto
-lanes: int
+lanes: int // across the screen
+side_lanes: int // extra lanes on each side, beyond the screen (crawl)
 lane_size: f64
 lane_origin: f64 // screen offset of the first lane (below the bar when sideways)
 heights: [dynamic]f64
@@ -332,13 +355,12 @@ quit := false
 ui_font: rl.Font
 tile_shader: rl.Shader
 tile_locs: struct {
-	size, radius, caption: c.int,
+	size, radius, caption, fade: c.int,
 }
+fade_shader: rl.Shader
+fade_loc: c.int
 
 crawl_toward := false // content comes out of the distance toward you
-crawl_rt: rl.RenderTexture2D
-crawl_shader: rl.Shader
-crawl_toward_loc: c.int
 
 lightbox: struct {
 	open:   bool,
@@ -386,12 +408,13 @@ main :: proc() {
 	ui_font = rl.LoadFontEx(ODIN_OS == .Windows ? "C:/Windows/Fonts/arial.ttf" : "/System/Library/Fonts/Supplemental/Arial.ttf", 48, nil, 0)
 	rl.SetTextureFilter(ui_font.texture, .BILINEAR)
 
-	tile_shader = rl.LoadShaderFromMemory(nil, TILE_FS)
+	tile_shader = rl.LoadShaderFromMemory(GRID_VS, TILE_FS)
 	tile_locs.size = rl.GetShaderLocation(tile_shader, "size")
 	tile_locs.radius = rl.GetShaderLocation(tile_shader, "radius")
 	tile_locs.caption = rl.GetShaderLocation(tile_shader, "caption")
-	crawl_shader = rl.LoadShaderFromMemory(nil, CRAWL_FS)
-	crawl_toward_loc = rl.GetShaderLocation(crawl_shader, "toward")
+	tile_locs.fade = rl.GetShaderLocation(tile_shader, "fadeDepth")
+	fade_shader = rl.LoadShaderFromMemory(GRID_VS, FADE_FS)
+	fade_loc = rl.GetShaderLocation(fade_shader, "fadeDepth")
 
 	clay_memory := make([]u8, clay.MinMemorySize())
 	arena := clay.CreateArenaWithCapacityAndMemory(c.size_t(len(clay_memory)), raw_data(clay_memory))
@@ -411,7 +434,7 @@ main :: proc() {
 		}
 	}
 
-	layout_cross, layout_sideways := -1.0, false
+	layout_cross, layout_origin, layout_mode := -1.0, 0.0, mode
 	for !rl.WindowShouldClose() && !quit {
 		frame += 1
 		sync.atomic_store(&loader.frame, frame)
@@ -432,17 +455,16 @@ main :: proc() {
 		// Keys and buttons above may have changed the mode.
 		sideways = mode == .Sideways
 		view_len = sideways ? sw : mode == .Crawl ? crawl_length(sh) : sh
-		if mode != .Crawl && crawl_rt.id != 0 {
-			rl.UnloadRenderTexture(crawl_rt) // ~80MB of VRAM
-			crawl_rt = {}
-		}
 
 		// Lanes span the width (columns), or the height below the bar (rows).
 		bar := ui_hidden ? 0 : BAR_H
 		cross, origin := sideways ? sh - bar : sw, sideways ? bar : 0
-		if cross != layout_cross || origin != lane_origin || sideways != layout_sideways || lane_count(cross) != lanes {
+		if cross != layout_cross || origin != layout_origin || mode != layout_mode || lane_count(cross) != lanes {
+			if (mode == .Crawl) != (layout_mode == .Crawl) {
+				for pic in loaded do set_tile_filter(&texs[pic].tex)
+			}
 			relayout(cross, origin)
-			layout_cross, layout_sideways = cross, sideways
+			layout_cross, layout_origin, layout_mode = cross, origin, mode
 		}
 
 		if !lightbox.open {
@@ -454,7 +476,7 @@ main :: proc() {
 
 		view_top := scroll - content_lead() // content position at the screen's leading edge
 		extend_layout(view_top + view_len * 4)
-		update_textures(view_top, view_len)
+		update_textures(view_top, view_len, sw, sh)
 		process_results(now)
 		evict()
 
@@ -468,11 +490,9 @@ main :: proc() {
 			}
 		}
 
-		if mode == .Crawl do render_crawl_texture(view_top, view_len, sw, now)
-
 		rl.BeginDrawing()
 		rl.ClearBackground(BG)
-		if mode == .Crawl do draw_crawl_plane(view_len, sw, sh)
+		if mode == .Crawl do draw_crawl_plane(view_top, view_len, sw, sh, now)
 		else do draw_grid(view_top, view_len, now)
 		render_clay(&commands)
 		rl.EndDrawing()
@@ -762,8 +782,10 @@ relayout :: proc(cross, origin: f64) {
 
 	lanes = lane_count(cross)
 	lane_size = max((cross - GAP * f64(lanes + 1)) / f64(lanes), 1)
-	lane_origin = origin
-	resize(&heights, lanes)
+	// The crawl plane widens past the screen so its far end still spans it.
+	side_lanes = mode == .Crawl ? int(math.ceil(crawl_overhang(cross) / (lane_size + GAP))) : 0
+	lane_origin = origin - f64(side_lanes) * (lane_size + GAP)
+	resize(&heights, lanes + 2 * side_lanes)
 	slice.fill(heights[:], 0)
 	clear(&placements)
 	max_tile_h = 0
@@ -909,11 +931,13 @@ enqueue :: proc(job: Job, front := false) {
 }
 
 // Marks pictures between content y0 and y1 as in use, and optionally queues
-// the ones that aren't loaded yet.
-mark_range :: proc(y0, y1: f64, request: bool) {
+// the ones that aren't loaded yet. In crawl mode, only the ones inside the
+// part of the plane on screen, or that will scroll into it.
+mark_range :: proc(y0, y1: f64, request: bool, view_top, view_len, sw, sh: f64) {
 	for i := first_index(y0); i < len(placements) && placements[i].y < y1; i += 1 {
 		p := placements[i]
 		if p.y + p.h < y0 do continue
+		if mode == .Crawl && !crawl_in_view(p, view_top, view_len, sw, sh) do continue
 		t := &texs[p.pic]
 		t.used = frame
 		sync.atomic_store(&loader.wanted[p.pic], frame)
@@ -924,13 +948,13 @@ mark_range :: proc(y0, y1: f64, request: bool) {
 	}
 }
 
-update_textures :: proc(view_top, view_h: f64) {
+update_textures :: proc(view_top, view_h, sw, sh: f64) {
 	view_bottom := view_top + view_h
 	// Visible tiles first, then a band ahead of (and a bit behind) the viewport.
-	mark_range(view_top, view_bottom, true)
-	mark_range(view_top - view_h * 0.5, view_bottom + view_h * 1.5, true)
+	mark_range(view_top, view_bottom, true, view_top, view_h, sw, sh)
+	mark_range(view_top - view_h * 0.5, view_bottom + view_h * 1.5, true, view_top, view_h, sw, sh)
 	// Textures stay loaded within a wider band so they don't thrash at the edges.
-	mark_range(view_top - view_h * 2, view_bottom + view_h * 3, false)
+	mark_range(view_top - view_h * 2, view_bottom + view_h * 3, false, view_top, view_h, sw, sh)
 	if lightbox.open do texs[lightbox.pic].used = frame
 }
 
@@ -963,12 +987,24 @@ process_results :: proc(now: f64) {
 			t.state = .Failed
 		case .Ok:
 			t.tex = rl.LoadTextureFromImage(r.image)
-			rl.SetTextureFilter(t.tex, .BILINEAR)
+			set_tile_filter(&t.tex)
 			t.state = .Ready
 			t.ready_at = now
 			append(&loaded, r.job.pic)
 		}
 	}
+}
+
+// Crawl minifies the far tiles heavily; mipmaps and anisotropic filtering
+// keep them from shimmering as they move.
+set_tile_filter :: proc(tex: ^rl.Texture2D) {
+	if mode != .Crawl {
+		rl.SetTextureFilter(tex^, .BILINEAR)
+		return
+	}
+	if tex.mipmaps == 1 do rl.GenTextureMipmaps(tex)
+	rl.SetTextureFilter(tex^, .TRILINEAR)
+	rl.SetTextureFilter(tex^, .ANISOTROPIC_16X)
 }
 
 evict :: proc() {
@@ -1060,16 +1096,21 @@ change_lanes :: proc(delta: int) {
 
 // --- Drawing -----------------------------------------------------------------
 
-// `crawl` draws for the crawl texture: no hover, and with `crawl_toward` each
-// image is flipped, because the texture is mapped onto the plane upside down.
+// `crawl` draws onto the crawl plane: no hover, the far end fades out, and with
+// `crawl_toward` each image is flipped, because the grid is mapped onto the
+// plane upside down.
 draw_grid :: proc(view_top, view_len: f64, now: f64, crawl := false) {
 	mouse := rl.GetMousePosition()
 	dpi := rl.GetWindowScaleDPI().x
 	flip := crawl && crawl_toward
 	first := first_index(view_top)
 	view_bottom := view_top + view_len
+	fade := crawl ? crawl_fade_depth(view_len) : 0
+	rl.SetShaderValue(fade_shader, fade_loc, &fade, .FLOAT)
+	rl.SetShaderValue(tile_shader, tile_locs.fade, &fade, .FLOAT)
 
 	// Placeholders (and hover detection) first...
+	rl.BeginShaderMode(fade_shader)
 	hovered := -1
 	for i := first; i < len(placements) && placements[i].y < view_bottom; i += 1 {
 		p := placements[i]
@@ -1082,6 +1123,7 @@ draw_grid :: proc(view_top, view_len: f64, now: f64, crawl := false) {
 		}
 		if !lightbox.open && rl.CheckCollisionPointRec(mouse, dst) do hovered = i
 	}
+	rl.EndShaderMode()
 	if crawl || (!ui_hidden && f64(mouse.y) <= BAR_H) || pointer_over_ui() do hovered = -1
 
 	// ...then the loaded images through the rounding shader.
@@ -1119,14 +1161,34 @@ draw_grid :: proc(view_top, view_len: f64, now: f64, crawl := false) {
 
 // --- Crawl -------------------------------------------------------------------
 //
-// The column grid for the whole plane is drawn into a render texture, which is
-// mapped onto a quad tilted back from the bottom edge of the screen. Away: the
-// texture's bottom (newest content) is the near edge, so tiles appear at the
-// bottom and recede. Toward: the texture's top is the near edge instead, so
-// tiles come out of the distance.
+// The column grid is drawn straight onto a plane tilted back from the bottom
+// edge of the screen. Away: the grid's bottom (newest content) is the near
+// edge, so tiles appear at the bottom and recede. Toward: its top is the near
+// edge instead, so tiles come out of the distance. The plane is wider than
+// the screen, by the same number of lanes on each side, so that it still fills
+// the screen's width at the far end.
 
 crawl_length :: proc(sh: f64) -> f64 {
-	return min(sh * CRAWL_SCREENS, CRAWL_MAX_TEX / f64(rl.GetWindowScaleDPI().y))
+	return sh * CRAWL_SCREENS
+}
+
+// Half the screen's width at distance s along the plane, in logical pixels.
+crawl_half_width :: proc(s, sw, sh: f64) -> f64 {
+	tilt := math.to_radians(f64(CRAWL_TILT))
+	return sw / 2 * (1 + 2 * s * math.sin(tilt) * math.tan(math.to_radians(f64(CRAWL_FOVY) / 2)) / sh)
+}
+
+// How far the plane reaches past each side of the screen.
+crawl_overhang :: proc(sw: f64) -> f64 {
+	return crawl_half_width(CRAWL_SCREENS, sw, 1) - sw / 2
+}
+
+// Whether a tile is inside the part of the plane on screen, or will scroll
+// into it, judged at its far end (the screen widens with distance).
+crawl_in_view :: proc(p: Placement, view_top, view_len, sw, sh: f64) -> bool {
+	s := crawl_toward ? p.y + p.h - view_top : view_top + view_len - p.y
+	hw := crawl_half_width(clamp(s, 0, view_len), sw, sh)
+	return p.x < sw / 2 + hw && p.x + p.w > sw / 2 - hw
 }
 
 // Looking straight ahead, at the distance where the z=0 plane exactly fills
@@ -1136,60 +1198,42 @@ crawl_camera :: proc(sh: f64) -> rl.Camera3D {
 	return {position = {0, 0, f32(d)}, up = {0, 1, 0}, fovy = CRAWL_FOVY, projection = .PERSPECTIVE}
 }
 
-// Near-left, near-right, far-right, far-left.
+// Near-left, near-right, far-right, far-left: the part of the plane that can
+// be on screen.
 crawl_corners :: proc(view_len, sw, sh: f64) -> [4]rl.Vector3 {
 	tilt := math.to_radians(f64(CRAWL_TILT))
-	x := f32(sw / 2 * CRAWL_UNIT)
+	x := f32(crawl_half_width(view_len, sw, sh) * CRAWL_UNIT)
 	y := f32(-sh / 2 * CRAWL_UNIT)
 	l := view_len * CRAWL_UNIT
 	fy, fz := y + f32(l * math.cos(tilt)), f32(-l * math.sin(tilt))
 	return {{-x, y, 0}, {x, y, 0}, {x, fy, fz}, {-x, fy, fz}}
 }
 
-render_crawl_texture :: proc(view_top, view_len, sw: f64, now: f64) {
-	dpi := rl.GetWindowScaleDPI().x
-	w, h := i32(sw * f64(dpi)), i32(view_len * f64(dpi))
-	if crawl_rt.texture.width != w || crawl_rt.texture.height != h {
-		if crawl_rt.id != 0 do rl.UnloadRenderTexture(crawl_rt)
-		crawl_rt = rl.LoadRenderTexture(w, h)
-	}
-
-	rl.BeginTextureMode(crawl_rt)
-	rl.ClearBackground(BG)
-	rl.BeginMode2D({zoom = dpi}) // draw in logical pixels at full resolution
-	draw_grid(view_top, view_len, now, crawl = true)
-	rl.EndMode2D()
-	rl.EndTextureMode()
-
-	// The far end is heavily minified; mipmaps + anisotropic filtering keep it
-	// from shimmering as it moves.
-	rl.GenTextureMipmaps(&crawl_rt.texture)
-	rl.SetTextureFilter(crawl_rt.texture, .TRILINEAR)
-	rl.SetTextureFilter(crawl_rt.texture, .ANISOTROPIC_16X)
+// World depth of the plane's far end, where it has faded out.
+crawl_fade_depth :: proc(view_len: f64) -> f32 {
+	return f32(view_len * math.sin(math.to_radians(f64(CRAWL_TILT))) * CRAWL_UNIT)
 }
 
-draw_crawl_plane :: proc(view_len, sw, sh: f64) {
-	c := crawl_corners(view_len, sw, sh)
-	// Render textures are stored bottom-up: v=0 is the bottom of what was drawn.
-	near_v, far_v: f32 = 0, 1
-	if crawl_toward do near_v, far_v = 1, 0
-	toward: f32 = crawl_toward ? 1 : 0
-
+draw_crawl_plane :: proc(view_top, view_len, sw, sh: f64, now: f64) {
 	rl.BeginMode3D(crawl_camera(sh))
-	rl.BeginShaderMode(crawl_shader)
-	rl.SetShaderValue(crawl_shader, crawl_toward_loc, &toward, .FLOAT)
+	// Everything is coplanar and drawn in order, as in 2D.
+	rlgl.DisableDepthTest()
 	rlgl.DisableBackfaceCulling()
-	rlgl.SetTexture(crawl_rt.texture.id)
-	rlgl.Begin(rlgl.QUADS)
-	rlgl.Color4ub(255, 255, 255, 255)
-	rlgl.TexCoord2f(0, near_v); rlgl.Vertex3f(c[0].x, c[0].y, c[0].z)
-	rlgl.TexCoord2f(1, near_v); rlgl.Vertex3f(c[1].x, c[1].y, c[1].z)
-	rlgl.TexCoord2f(1, far_v); rlgl.Vertex3f(c[2].x, c[2].y, c[2].z)
-	rlgl.TexCoord2f(0, far_v); rlgl.Vertex3f(c[3].x, c[3].y, c[3].z)
-	rlgl.End()
-	rlgl.SetTexture(0)
+
+	// Maps the grid's logical pixels onto the plane: across stays x (centered
+	// on the screen), and y becomes the distance from the near edge.
+	along, sign: f32 = f32(view_len), -1
+	if crawl_toward do along, sign = 0, 1
+	rlgl.PushMatrix()
+	rlgl.Translatef(0, f32(-sh / 2 * CRAWL_UNIT), 0)
+	rlgl.Rotatef(-CRAWL_TILT, 1, 0, 0)
+	rlgl.Scalef(CRAWL_UNIT, CRAWL_UNIT, CRAWL_UNIT)
+	rlgl.Translatef(f32(-sw / 2), along, 0)
+	rlgl.Scalef(1, sign, 1)
+	draw_grid(view_top, view_len, now, crawl = true)
+	rlgl.PopMatrix()
+
 	rlgl.EnableBackfaceCulling()
-	rl.EndShaderMode()
 	rl.EndMode3D()
 }
 
