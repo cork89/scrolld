@@ -34,7 +34,7 @@ import rlgl "vendor:raylib/rlgl"
 import stbi "vendor:stb/image"
 import clay "clay-odin"
 
-// Requires Homebrew's raylib, webp and libheif packages on macOS. On Windows,
+// Requires Homebrew's raylib, webp, libheif and jpeg-turbo packages on macOS. On Windows,
 // raylib comes with Odin, webp is Google's static build fetched by `just deps`,
 // and libheif is windows/libheif.dll, built HEVC-decode-only by `just libheif`.
 //
@@ -53,16 +53,77 @@ when ODIN_OS == .Windows {
 
 WEBP_DECODER_ABI_VERSION :: 0x0210
 WEBP_STATUS_NOT_ENOUGH_DATA :: 7
+WEBP_MODE_RGBA :: 1
 
 WebP_Features :: struct {
 	width, height, has_alpha, has_animation, format: c.int,
 	pad:                                             [5]u32,
 }
 
+// WebPDecBuffer, with only the RGBA view of its union.
+WebP_Dec_Buffer :: struct {
+	colorspace, width, height, is_external_memory: c.int,
+	rgba:                                          [^]u8,
+	stride:                                        c.int,
+	size:                                          c.size_t,
+	yuva_rest:                                     [56]u8, // the union's YUVA view is bigger
+	pad:                                           [4]u32,
+	private_memory:                                rawptr,
+}
+
+WebP_Decoder_Options :: struct {
+	bypass_filtering, no_fancy_upsampling, use_cropping: c.int,
+	crop_left, crop_top, crop_width, crop_height:        c.int,
+	use_scaling, scaled_width, scaled_height:            c.int,
+	use_threads, dithering_strength, flip:               c.int,
+	alpha_dithering_strength:                            c.int,
+	pad:                                                 [5]u32,
+}
+
+WebP_Decoder_Config :: struct {
+	input:   WebP_Features,
+	output:  WebP_Dec_Buffer,
+	options: WebP_Decoder_Options,
+}
+#assert(size_of(WebP_Decoder_Config) == 240 && offset_of(WebP_Decoder_Config, options) == 160)
+
 @(default_calling_convention = "c")
 foreign webp {
 	WebPGetFeaturesInternal :: proc(data: [^]u8, size: c.size_t, features: ^WebP_Features, version: c.int) -> c.int ---
-	WebPDecodeRGBA :: proc(data: [^]u8, size: c.size_t, width, height: ^c.int) -> [^]u8 ---
+	WebPInitDecoderConfigInternal :: proc(config: ^WebP_Decoder_Config, version: c.int) -> c.int ---
+	WebPDecode :: proc(data: [^]u8, size: c.size_t, config: ^WebP_Decoder_Config) -> c.int ---
+}
+
+// JPEGs are decoded with libjpeg-turbo, which can scale them down by up to 8x
+// while decoding, far faster than decoding them whole. It isn't set up on
+// Windows yet, so stb_image decodes them there.
+TURBOJPEG :: ODIN_OS != .Windows
+
+when TURBOJPEG {
+	@(extra_linker_flags = "-L/opt/homebrew/opt/jpeg-turbo/lib")
+	foreign import turbojpeg "system:turbojpeg"
+
+	TJINIT_DECOMPRESS :: 1
+	TJPARAM_JPEGWIDTH :: 5
+	TJPARAM_JPEGHEIGHT :: 6
+	TJPF_RGB :: 0
+	TJERR_WARNING :: 0
+
+	Tj_Scaling_Factor :: struct {
+		num, denom: c.int,
+	}
+
+	@(default_calling_convention = "c")
+	foreign turbojpeg {
+		tj3Init :: proc(init_type: c.int) -> rawptr ---
+		tj3Destroy :: proc(handle: rawptr) ---
+		tj3Get :: proc(handle: rawptr, param: c.int) -> c.int ---
+		tj3GetErrorCode :: proc(handle: rawptr) -> c.int ---
+		tj3DecompressHeader :: proc(handle: rawptr, jpeg: [^]u8, size: c.size_t) -> c.int ---
+		tj3GetScalingFactors :: proc(count: ^c.int) -> [^]Tj_Scaling_Factor ---
+		tj3SetScalingFactor :: proc(handle: rawptr, factor: Tj_Scaling_Factor) -> c.int ---
+		tj3Decompress8 :: proc(handle: rawptr, jpeg: [^]u8, size: c.size_t, dst: [^]u8, pitch, pixel_format: c.int) -> c.int ---
+	}
 }
 
 // HEIC/HEIF comes from Homebrew's libheif (`brew install libheif`).
@@ -200,16 +261,23 @@ in vec4 fragColor;
 in float fragFar;
 uniform sampler2D texture0;
 uniform vec4 colDiffuse;
-uniform vec2 size;     // tile size in physical pixels
+uniform float lane;    // tile size across its lane in physical pixels
+uniform int rows;      // images are turned a quarter turn, so lane is their height
 uniform float radius;  // physical pixels
 uniform float caption; // caption band height in physical pixels, 0 = none
 out vec4 finalColor;
 
 void main() {
+	// The tile's length along its lane changes per tile, so it comes in the
+	// vertex color's RGB (24-bit fixed point, 1/16 px) rather than splitting
+	// the batch with a uniform. The color's alpha is the fade-in.
+	float along = dot(round(fragColor.rgb * 255.0), vec3(4096.0, 16.0, 1.0 / 16.0));
+	vec2 size = rows != 0 ? vec2(along, lane) : vec2(lane, along);
 	vec2 p = fragTexCoord * size;
 	vec2 q = abs(p - size * 0.5) - (size * 0.5 - radius);
 	float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
-	vec4 c = texture(texture0, fragTexCoord) * colDiffuse * fragColor;
+	vec4 c = texture(texture0, fragTexCoord) * colDiffuse;
+	c.a *= fragColor.a;
 	if (caption > 0.0) {
 		c.rgb *= 1.0 - 0.7 * clamp((p.y - (size.y - caption)) / caption, 0.0, 1.0);
 	}
@@ -234,6 +302,7 @@ MUTED :: clay.Color{138, 138, 150, 255}
 
 Format :: enum {
 	Stb, // everything stb_image reads
+	Jpeg,
 	Webp,
 	Heif,
 }
@@ -409,7 +478,7 @@ quit := false
 ui_font: rl.Font
 tile_shader: rl.Shader
 tile_locs: struct {
-	size, radius, caption, fade: c.int,
+	lane, rows, radius, caption, fade: c.int,
 }
 fade_shader: rl.Shader
 fade_loc: c.int
@@ -469,13 +538,17 @@ main :: proc() {
 	rl.SetTextureFilter(ui_font.texture, .BILINEAR)
 
 	tile_shader = rl.LoadShaderFromMemory(GRID_VS, TILE_FS)
-	tile_locs.size = rl.GetShaderLocation(tile_shader, "size")
+	tile_locs.lane = rl.GetShaderLocation(tile_shader, "lane")
+	tile_locs.rows = rl.GetShaderLocation(tile_shader, "rows")
 	tile_locs.radius = rl.GetShaderLocation(tile_shader, "radius")
 	tile_locs.caption = rl.GetShaderLocation(tile_shader, "caption")
 	tile_locs.fade = rl.GetShaderLocation(tile_shader, "fadeDepth")
 	fade_shader = rl.LoadShaderFromMemory(GRID_VS, FADE_FS)
 	fade_loc = rl.GetShaderLocation(fade_shader, "fadeDepth")
 
+	// The UI is well under a hundred elements; Clay's defaults (8192) take 6 MB.
+	clay.SetMaxElementCount(512)
+	clay.SetMaxMeasureTextCacheWordCount(1024)
 	clay_memory := make([]u8, clay.MinMemorySize())
 	arena := clay.CreateArenaWithCapacityAndMemory(c.size_t(len(clay_memory)), raw_data(clay_memory))
 	clay.Initialize(arena, {1280, 800}, {handler = clay_error})
@@ -742,15 +815,16 @@ scan :: proc() {
 		path := strings.clone_to_cstring(info.fullpath)
 		format: Format
 		switch ext {
+		case ".jpg", ".jpeg":  if TURBOJPEG do format = .Jpeg
 		case ".webp":          format = .Webp
 		case ".heic", ".heif": format = .Heif
 		}
 		w, h, comp: c.int
 		ok: bool
 		switch format {
-		case .Stb:  ok = stbi.info(path, &w, &h, &comp) != 0
-		case .Webp: ok = webp_info(info.fullpath, webp_header, &w, &h)
-		case .Heif: ok = heif_info(path, &w, &h)
+		case .Stb, .Jpeg: ok = stbi.info(path, &w, &h, &comp) != 0
+		case .Webp:       ok = webp_info(info.fullpath, webp_header, &w, &h)
+		case .Heif:       ok = heif_info(path, &w, &h)
 		}
 		if !ok || w <= 0 || h <= 0 {
 			delete(path)
@@ -1023,16 +1097,18 @@ worker :: proc() {
 		} else {
 			// CPU-only work is safe off the main thread; GPU upload is not.
 			pic := pics[job.pic]
+			// The JPEG, WebP and HEIF decoders shrink to about target_w themselves.
 			switch pic.format {
 			case .Stb:  res.image = load_image(pic.path)
-			case .Webp: res.image = load_webp(string(pic.path))
-			case .Heif: res.image = load_heif(pic.path)
+			case .Jpeg: when TURBOJPEG do res.image = load_jpeg(pic.path, job.target_w)
+			case .Webp: res.image = load_webp(string(pic.path), job.target_w)
+			case .Heif: res.image = load_heif(pic.path, job.target_w)
 			}
 			if res.image.data == nil {
 				res.status = .Failed
 			} else if res.image.width > job.target_w {
-				h := c.int(f64(res.image.height) * f64(job.target_w) / f64(res.image.width))
-				rl.ImageResize(&res.image, job.target_w, max(h, 1))
+				w, h := shrunk(res.image.width, res.image.height, job.target_w)
+				rl.ImageResize(&res.image, w, h)
 			}
 		}
 
@@ -1058,20 +1134,80 @@ load_image :: proc(path: cstring) -> rl.Image {
 	return {data = data, width = w, height = h, mipmaps = 1, format = format}
 }
 
-// libwebp also allocates with malloc, so raylib can resize and free it too.
-load_webp :: proc(path: string) -> rl.Image {
+// The size of a w x h image shrunk to at most max_w wide.
+shrunk :: proc(w, h, max_w: c.int) -> (c.int, c.int) {
+	if w <= max_w do return w, h
+	return max_w, max(c.int(f64(h) * f64(max_w) / f64(w)), 1)
+}
+
+when TURBOJPEG {
+	// Decodes at the smallest scale libjpeg-turbo offers that's at least
+	// target_w wide, leaving the rest to the worker's resize. JPEGs it can't
+	// decode (CMYK, 12-bit...) go to stb_image.
+	load_jpeg :: proc(path: cstring, target_w: i32) -> rl.Image {
+		scaled :: proc(dim: c.int, f: Tj_Scaling_Factor) -> c.int {return (dim * f.num + f.denom - 1) / f.denom}
+
+		data, err := os.read_entire_file(string(path), context.allocator)
+		if err != nil do return {}
+		defer delete(data)
+		tj := tj3Init(TJINIT_DECOMPRESS)
+		if tj == nil do return load_image(path)
+		defer tj3Destroy(tj)
+		if tj3DecompressHeader(tj, raw_data(data), c.size_t(len(data))) != 0 do return load_image(path)
+		jw, jh := tj3Get(tj, TJPARAM_JPEGWIDTH), tj3Get(tj, TJPARAM_JPEGHEIGHT)
+
+		n: c.int
+		factors := tj3GetScalingFactors(&n)
+		best := Tj_Scaling_Factor{1, 1}
+		for f in factors[:n] {
+			sw := scaled(jw, f)
+			if f.num < f.denom && sw >= target_w && sw < scaled(jw, best) do best = f
+		}
+		if tj3SetScalingFactor(tj, best) != 0 do return load_image(path)
+
+		w, h := scaled(jw, best), scaled(jh, best)
+		pixels := ([^]u8)(libc.malloc(c.size_t(w) * c.size_t(h) * 3))
+		if pixels == nil do return {}
+		// A warning means it's damaged but decoded what it could, as stb_image does.
+		if tj3Decompress8(tj, raw_data(data), c.size_t(len(data)), pixels, 0, TJPF_RGB) != 0 && tj3GetErrorCode(tj) != TJERR_WARNING {
+			libc.free(pixels)
+			return load_image(path)
+		}
+		return {data = pixels, width = w, height = h, mipmaps = 1, format = .UNCOMPRESSED_R8G8B8}
+	}
+}
+
+// Decodes straight to target_w wide when that's smaller, into a malloc'd
+// buffer raylib can free.
+load_webp :: proc(path: string, target_w: i32) -> rl.Image {
 	data, err := os.read_entire_file(path, context.allocator)
 	if err != nil do return {}
 	defer delete(data)
-	w, h: c.int
-	pixels := WebPDecodeRGBA(raw_data(data), c.size_t(len(data)), &w, &h)
+	config: WebP_Decoder_Config
+	if WebPInitDecoderConfigInternal(&config, WEBP_DECODER_ABI_VERSION) == 0 do return {}
+	if WebPGetFeaturesInternal(raw_data(data), c.size_t(len(data)), &config.input, WEBP_DECODER_ABI_VERSION) != 0 do return {}
+
+	w, h := shrunk(config.input.width, config.input.height, target_w)
+	if w != config.input.width {
+		config.options.use_scaling, config.options.scaled_width, config.options.scaled_height = 1, w, h
+	}
+	row := c.size_t(w) * 4
+	pixels := ([^]u8)(libc.malloc(row * c.size_t(h)))
 	if pixels == nil do return {}
+	config.output.colorspace = WEBP_MODE_RGBA
+	config.output.is_external_memory = 1
+	config.output.rgba, config.output.stride, config.output.size = pixels, c.int(row), row * c.size_t(h)
+	if WebPDecode(raw_data(data), c.size_t(len(data)), &config) != 0 {
+		libc.free(pixels)
+		return {}
+	}
 	return {data = pixels, width = w, height = h, mipmaps = 1, format = .UNCOMPRESSED_R8G8B8A8}
 }
 
 // libheif owns its pixels, so they're copied (dropping any row padding) into a
-// malloc'd buffer raylib can resize and free.
-load_heif :: proc(path: cstring) -> rl.Image {
+// malloc'd buffer raylib can free, shrunk to target_w on the way when they're
+// wider, so there's never a second full-size copy.
+load_heif :: proc(path: cstring, target_w: i32) -> rl.Image {
 	ctx := heif_context_alloc()
 	defer heif_context_free(ctx)
 	if heif_context_read_from_file(ctx, path, nil).code != 0 do return {}
@@ -1088,12 +1224,18 @@ load_heif :: proc(path: cstring) -> rl.Image {
 	src := heif_image_get_plane_readonly2(img, HEIF_CHANNEL_INTERLEAVED, &stride)
 	row := c.size_t(w) * 4
 	if src == nil || w <= 0 || h <= 0 || stride < row do return {}
-	pixels := ([^]u8)(libc.malloc(row * c.size_t(h)))
+	ow, oh := shrunk(w, h, target_w)
+	pixels := ([^]u8)(libc.malloc(c.size_t(ow) * c.size_t(oh) * 4))
 	if pixels == nil do return {}
-	for y in 0 ..< c.size_t(h) {
-		libc.memcpy(pixels[y * row:], src[y * stride:], row)
+	if ow == w {
+		for y in 0 ..< c.size_t(h) {
+			libc.memcpy(pixels[y * row:], src[y * stride:], row)
+		}
+	} else if stbi.resize_uint8(src, w, h, c.int(stride), pixels, ow, oh, 0, 4) == 0 {
+		libc.free(pixels)
+		return {}
 	}
-	return {data = pixels, width = w, height = h, mipmaps = 1, format = .UNCOMPRESSED_R8G8B8A8}
+	return {data = pixels, width = ow, height = oh, mipmaps = 1, format = .UNCOMPRESSED_R8G8B8A8}
 }
 
 enqueue :: proc(job: Job, front := false) {
@@ -1131,22 +1273,26 @@ update_textures :: proc(view_top, view_h: f64) {
 	if lightbox.open do texs[lightbox.pic].used = frame
 }
 
+// Only uploads count toward MAX_UPLOADS_PER_FRAME: results that need none
+// (skipped, failed, stale) are cleared right away, so they can't hold up the
+// rest while scrolling fast.
 process_results :: proc(now: f64) {
-	batch: [MAX_UPLOADS_PER_FRAME]Result
-	n := 0
-	sync.mutex_lock(&loader.mutex)
-	for n < len(batch) && len(loader.results) > 0 {
-		batch[n] = pop_front(&loader.results)
-		n += 1
-	}
-	sync.mutex_unlock(&loader.mutex)
+	uploads := 0
+	for uploads < MAX_UPLOADS_PER_FRAME {
+		sync.mutex_lock(&loader.mutex)
+		if len(loader.results) == 0 {
+			sync.mutex_unlock(&loader.mutex)
+			break
+		}
+		r := pop_front(&loader.results)
+		sync.mutex_unlock(&loader.mutex)
 
-	for &r in batch[:n] {
 		defer rl.UnloadImage(r.image)
 		if r.job.lightbox {
 			if lightbox.open && r.job.generation == lightbox.id && r.status == .Ok {
 				lightbox.tex = rl.LoadTextureFromImage(r.image)
 				rl.SetTextureFilter(lightbox.tex, .BILINEAR)
+				uploads += 1
 			}
 			continue
 		}
@@ -1164,6 +1310,7 @@ process_results :: proc(now: f64) {
 			t.state = .Ready
 			t.ready_at = now
 			append(&loaded, r.job.pic)
+			uploads += 1
 		}
 	}
 }
@@ -1371,27 +1518,23 @@ draw_grid :: proc(view_top, view_len: f64, hovered: int, now: f64) {
 	}
 	rl.EndShaderMode()
 
-	// ...then the loaded images through the rounding shader, each turned about
-	// its center to stand upright.
+	// ...then the loaded images through the rounding shader, all in one batch,
+	// but for the hovered one, whose caption needs a uniform of its own.
 	rl.BeginShaderMode(tile_shader)
-	radius := TILE_RADIUS * dpi
+	radius, lane, as_rows, caption := TILE_RADIUS * dpi, f32(lane_size) * dpi, i32(rows), f32(0)
 	rl.SetShaderValue(tile_shader, tile_locs.radius, &radius, .FLOAT)
+	rl.SetShaderValue(tile_shader, tile_locs.lane, &lane, .FLOAT)
+	rl.SetShaderValue(tile_shader, tile_locs.rows, &as_rows, .INT)
+	rl.SetShaderValue(tile_shader, tile_locs.caption, &caption, .FLOAT)
 	for i := first; i < len(placements) && placements[i].y < view_bottom; i += 1 {
-		p := placements[i]
-		t := &texs[p.pic]
-		if p.y + p.h < view_top || t.state != .Ready || !in_view(p) do continue
-		dst := tile_rect(p)
-		w, h := image_size(dst)
-		size := [2]f32{w * dpi, h * dpi}
-		caption := i == hovered ? CAPTION_H * dpi : 0
+		if i != hovered do draw_tile(placements[i], view_top, rot, dpi, now)
+	}
+	if hovered >= 0 {
 		// Uniforms apply to the whole pending batch, so flush before changing them.
 		rlgl.DrawRenderBatchActive()
-		rl.SetShaderValue(tile_shader, tile_locs.size, &size, .VEC2)
+		caption = CAPTION_H * dpi
 		rl.SetShaderValue(tile_shader, tile_locs.caption, &caption, .FLOAT)
-		alpha := f32(clamp((now - t.ready_at) / FADE_IN_SECS, 0, 1))
-		src := rl.Rectangle{0, 0, f32(t.tex.width), f32(t.tex.height)}
-		centered := rl.Rectangle{dst.x + dst.width / 2, dst.y + dst.height / 2, w, h}
-		rl.DrawTexturePro(t.tex, src, centered, {w / 2, h / 2}, rot, rl.Fade(rl.WHITE, alpha))
+		draw_tile(placements[hovered], view_top, rot, dpi, now)
 	}
 	rl.EndShaderMode()
 
@@ -1406,6 +1549,20 @@ draw_grid :: proc(view_top, view_len: f64, hovered: int, now: f64) {
 		rl.DrawTextEx(ui_font, name, {-w / 2 + 10, h / 2 - CAPTION_H + 14}, 16, 0, rl.RAYWHITE)
 		rlgl.PopMatrix()
 	}
+}
+
+// Draws a loaded tile through TILE_FS, turned about its center to stand upright.
+draw_tile :: proc(p: Placement, view_top: f64, rot, dpi: f32, now: f64) {
+	t := &texs[p.pic]
+	if p.y + p.h < view_top || t.state != .Ready || !in_view(p) do return
+	dst := tile_rect(p)
+	w, h := image_size(dst)
+	along := u32(p.h * f64(dpi) * 16 + 0.5) // see TILE_FS
+	alpha := clamp((now - t.ready_at) / FADE_IN_SECS, 0, 1)
+	tint := rl.Color{u8(along >> 16), u8(along >> 8), u8(along), u8(alpha * 255)}
+	src := rl.Rectangle{0, 0, f32(t.tex.width), f32(t.tex.height)}
+	centered := rl.Rectangle{dst.x + dst.width / 2, dst.y + dst.height / 2, w, h}
+	rl.DrawTexturePro(t.tex, src, centered, {w / 2, h / 2}, rot, tint)
 }
 
 // The text, cut short with "..." if needed to fit max_w at the font size.

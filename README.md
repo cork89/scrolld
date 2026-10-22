@@ -5,7 +5,7 @@
 ### macOS
 
 ```sh
-brew install odin just raylib webp libheif
+brew install odin just raylib webp libheif jpeg-turbo
 just build
 ```
 
