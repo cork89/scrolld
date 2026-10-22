@@ -2,6 +2,9 @@
 
 - a command line utility to auto scroll your image library
 
+https://github.com/user-attachments/assets/f46165a7-bb58-4dda-85b1-9589ec7481cb
+
+
 ## Quick start
 
 ### macOS
