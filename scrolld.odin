@@ -2,6 +2,7 @@
 //
 // Build:  just build   (odin build . -define:RAYLIB_SHARED=true -o:speed -out:bin/scrolld)
 // Run:    ./bin/scrolld [dir] [-r] [-s] [-x]
+// Web:    just web dir   (into bin/web; see web.odin)
 //
 // The grid is drawn with raylib on a plane in 3D; Clay lays out the top bar,
 // the angle panel and the full-size viewer. The wall scrolls in any of eight
@@ -13,192 +14,30 @@
 //
 // Settings changed in the app (direction, angle, speed, lanes...) are saved to
 // ~/.scrolld/settings whenever they change, and loaded on the next launch.
+//
+// This file is shared by both builds. desktop.odin and web.odin each provide
+// main, scan, the loader (enqueue, next_result, upload...) and where settings
+// are kept.
 package main
 
 import "base:runtime"
 import "core:c"
-import "core:c/libc"
 import "core:fmt"
 import "core:math"
 import "core:math/linalg"
 import "core:math/rand"
-import "core:os"
 import "core:slice"
 import "core:strconv"
 import "core:strings"
-import "core:sync"
-import "core:thread"
 import "core:unicode/utf8"
 import rl "vendor:raylib"
 import rlgl "vendor:raylib/rlgl"
-import stbi "vendor:stb/image"
 import clay "clay-odin"
-
-// Requires Homebrew's raylib, webp, libheif and jpeg-turbo packages on macOS. On Windows,
-// raylib comes with Odin, webp is Google's static build fetched by `just deps`,
-// and libheif is windows/libheif.dll, built HEVC-decode-only by `just libheif`.
-//
-// raylib's own copy of stb_image is built without JPEG support, and linking it
-// statically clashes with vendor:stb/image. Linking raylib as a dylib keeps its
-// copy private, so images are decoded with the full stb_image.
-#assert(rl.RAYLIB_SHARED, "build with -define:RAYLIB_SHARED=true")
-
-// WebP comes from Homebrew's libwebp (`brew install webp`).
-when ODIN_OS == .Windows {
-	foreign import webp "windows/libwebp/lib/libwebp.lib"
-} else {
-	@(extra_linker_flags = "-L/opt/homebrew/opt/webp/lib")
-	foreign import webp "system:webp"
-}
-
-WEBP_DECODER_ABI_VERSION :: 0x0210
-WEBP_STATUS_NOT_ENOUGH_DATA :: 7
-WEBP_MODE_RGBA :: 1
-
-WebP_Features :: struct {
-	width, height, has_alpha, has_animation, format: c.int,
-	pad:                                             [5]u32,
-}
-
-// WebPDecBuffer, with only the RGBA view of its union.
-WebP_Dec_Buffer :: struct {
-	colorspace, width, height, is_external_memory: c.int,
-	rgba:                                          [^]u8,
-	stride:                                        c.int,
-	size:                                          c.size_t,
-	yuva_rest:                                     [56]u8, // the union's YUVA view is bigger
-	pad:                                           [4]u32,
-	private_memory:                                rawptr,
-}
-
-WebP_Decoder_Options :: struct {
-	bypass_filtering, no_fancy_upsampling, use_cropping: c.int,
-	crop_left, crop_top, crop_width, crop_height:        c.int,
-	use_scaling, scaled_width, scaled_height:            c.int,
-	use_threads, dithering_strength, flip:               c.int,
-	alpha_dithering_strength:                            c.int,
-	pad:                                                 [5]u32,
-}
-
-WebP_Decoder_Config :: struct {
-	input:   WebP_Features,
-	output:  WebP_Dec_Buffer,
-	options: WebP_Decoder_Options,
-}
-#assert(size_of(WebP_Decoder_Config) == 240 && offset_of(WebP_Decoder_Config, options) == 160)
-
-@(default_calling_convention = "c")
-foreign webp {
-	WebPGetFeaturesInternal :: proc(data: [^]u8, size: c.size_t, features: ^WebP_Features, version: c.int) -> c.int ---
-	WebPInitDecoderConfigInternal :: proc(config: ^WebP_Decoder_Config, version: c.int) -> c.int ---
-	WebPDecode :: proc(data: [^]u8, size: c.size_t, config: ^WebP_Decoder_Config) -> c.int ---
-}
-
-// JPEGs are decoded with libjpeg-turbo, which can scale them down by up to 8x
-// while decoding, far faster than decoding them whole. It isn't set up on
-// Windows yet, so stb_image decodes them there.
-TURBOJPEG :: ODIN_OS != .Windows
-
-when TURBOJPEG {
-	@(extra_linker_flags = "-L/opt/homebrew/opt/jpeg-turbo/lib")
-	foreign import turbojpeg "system:turbojpeg"
-
-	TJINIT_DECOMPRESS :: 1
-	TJPARAM_JPEGWIDTH :: 5
-	TJPARAM_JPEGHEIGHT :: 6
-	TJPF_RGB :: 0
-	TJERR_WARNING :: 0
-
-	Tj_Scaling_Factor :: struct {
-		num, denom: c.int,
-	}
-
-	@(default_calling_convention = "c")
-	foreign turbojpeg {
-		tj3Init :: proc(init_type: c.int) -> rawptr ---
-		tj3Destroy :: proc(handle: rawptr) ---
-		tj3Get :: proc(handle: rawptr, param: c.int) -> c.int ---
-		tj3GetErrorCode :: proc(handle: rawptr) -> c.int ---
-		tj3DecompressHeader :: proc(handle: rawptr, jpeg: [^]u8, size: c.size_t) -> c.int ---
-		tj3GetScalingFactors :: proc(count: ^c.int) -> [^]Tj_Scaling_Factor ---
-		tj3SetScalingFactor :: proc(handle: rawptr, factor: Tj_Scaling_Factor) -> c.int ---
-		tj3Decompress8 :: proc(handle: rawptr, jpeg: [^]u8, size: c.size_t, dst: [^]u8, pitch, pixel_format: c.int) -> c.int ---
-	}
-}
-
-// HEIC/HEIF comes from Homebrew's libheif (`brew install libheif`).
-when ODIN_OS == .Windows {
-	foreign import heif "windows/heif.lib"
-} else {
-	@(extra_linker_flags = "-L/opt/homebrew/opt/libheif/lib")
-	foreign import heif "system:heif"
-}
-
-HEIF_COLORSPACE_RGB :: 1
-HEIF_CHROMA_INTERLEAVED_RGBA :: 11
-HEIF_CHANNEL_INTERLEAVED :: 10
-
-Heif_Error :: struct {
-	code, subcode: c.int,
-	message:       cstring,
-}
-
-Heif_Context :: struct {}
-Heif_Handle :: struct {}
-Heif_Image :: struct {}
-
-@(default_calling_convention = "c")
-foreign heif {
-	heif_init :: proc(params: rawptr) -> Heif_Error ---
-	heif_context_alloc :: proc() -> ^Heif_Context ---
-	heif_context_free :: proc(ctx: ^Heif_Context) ---
-	heif_context_read_from_file :: proc(ctx: ^Heif_Context, filename: cstring, options: rawptr) -> Heif_Error ---
-	heif_context_get_primary_image_handle :: proc(ctx: ^Heif_Context, handle: ^^Heif_Handle) -> Heif_Error ---
-	heif_image_handle_get_width :: proc(handle: ^Heif_Handle) -> c.int ---
-	heif_image_handle_get_height :: proc(handle: ^Heif_Handle) -> c.int ---
-	heif_image_handle_release :: proc(handle: ^Heif_Handle) ---
-	heif_decode_image :: proc(handle: ^Heif_Handle, img: ^^Heif_Image, colorspace, chroma: c.int, options: rawptr) -> Heif_Error ---
-	heif_image_get_width :: proc(img: ^Heif_Image, channel: c.int) -> c.int ---
-	heif_image_get_height :: proc(img: ^Heif_Image, channel: c.int) -> c.int ---
-	heif_image_get_plane_readonly2 :: proc(img: ^Heif_Image, channel: c.int, stride: ^c.size_t) -> [^]u8 ---
-	heif_image_release :: proc(img: ^Heif_Image) ---
-}
-
-USAGE :: `Usage: scrolld [dir] [options]
-
-Show the images in a directory (default: current directory) as an
-auto-scrolling masonry wall that wraps around forever.
-
-Options:
-  -r, --recursive   Include images in subdirectories
-  -s, --shuffle     Random order (a new order on each pass)
-  -x, --sideways    Start scrolling right (rows)
-  -c, --crawl       Start tilted back, receding into the distance
-  -h, --help        Show this help
-
-Keys:
-  Space       Start / pause auto scroll
-  + / -       Faster / slower
-  [ / ]       Fewer / more lanes (0 = auto)
-  D           Next direction, clockwise
-  A           Show / hide the angle panel
-  R           Reset the angle to flat
-  Wheel, arrows, PgUp/PgDn   Scroll manually
-  Click       Open full size (Esc or click to close)
-  Drag        Rotate the wall, while the angle panel is open
-              (Shift: one axis at a time, Ctrl or Cmd: spin)
-  F           Toggle fullscreen
-  H, ☰ button Hide / show the top bar
-  Esc, Q      Quit
-
-Direction, angle, speed, lanes, fullscreen, auto scroll and the top bar are
-remembered in ~/.scrolld/settings. Options above override them for a run.`
 
 GAP :: 10.0
 BAR_H :: 56.0
 MIN_COL_W :: 280.0
 MIN_ROW_H :: 220.0
-WORKERS :: 4
 MAX_UPLOADS_PER_FRAME :: 4
 EVICT_AFTER_FRAMES :: 180
 SPEED_STEP :: 20.0
@@ -217,11 +56,14 @@ DEFAULT_FOV :: 45.0
 CRAWL_TILT :: 62.0 // the Crawl preset
 DRAG_DEGREES_PER_PX :: 0.3
 
+// The shaders are GLSL 3.30 on the desktop and GLSL ES 3.00 (WebGL 2) on the
+// web, which take the same code under a different header.
+GLSL_HEADER :: "#version 300 es\nprecision highp float;\n" when ODIN_OS == .JS else "#version 330\n"
+
 // raylib's default vertex shader, plus how far behind the screen each vertex
 // is (0 at the screen, 1 where the wall has faded out). rlgl applies the
 // plane's transform on the CPU, so vertexPosition is already in world space.
-GRID_VS :: `#version 330
-in vec3 vertexPosition;
+GRID_VS :: GLSL_HEADER + `in vec3 vertexPosition;
 in vec2 vertexTexCoord;
 in vec4 vertexColor;
 uniform mat4 mvp;
@@ -238,8 +80,7 @@ void main() {
 }`
 
 // Placeholders: fades the far end of the wall into the background.
-FADE_FS :: `#version 330
-in vec2 fragTexCoord;
+FADE_FS :: GLSL_HEADER + `in vec2 fragTexCoord;
 in vec4 fragColor;
 in float fragFar;
 uniform sampler2D texture0;
@@ -255,8 +96,7 @@ void main() {
 // darkens its bottom edge behind the hover caption so that stays inside the
 // corners too. The edge is antialiased over one screen pixel, however small
 // the tile is drawn, and fades like FADE_FS.
-TILE_FS :: `#version 330
-in vec2 fragTexCoord;
+TILE_FS :: GLSL_HEADER + `in vec2 fragTexCoord;
 in vec4 fragColor;
 in float fragFar;
 uniform sampler2D texture0;
@@ -285,10 +125,6 @@ void main() {
 	float fade = 1.0 - smoothstep(0.55, 1.0, fragFar);
 	finalColor = vec4(c.rgb, c.a * fade * clamp(0.5 - d / aa, 0.0, 1.0));
 }`
-
-ICON_PNG :: #load("icon.png") // icon.svg rendered at 256 px
-
-IMAGE_EXTS :=[?]string{".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".heif"}
 
 BG :: rl.Color{15, 15, 18, 255}
 TILE_BG :: rl.Color{34, 34, 42, 255}
@@ -358,17 +194,7 @@ Result_Status :: enum {
 Result :: struct {
 	job:    Job,
 	status: Result_Status,
-	image:  rl.Image,
-}
-
-Loader :: struct {
-	mutex:   sync.Mutex,
-	cond:    sync.Cond,
-	jobs:    [dynamic]Job,
-	results: [dynamic]Result,
-	quit:    bool,
-	frame:   u64, // atomic
-	wanted:  []u64, // atomic, per picture: last frame it was in range
+	image:  Decoded,
 }
 
 // Which way the content moves on screen, clockwise from up in 45° steps.
@@ -432,13 +258,10 @@ Settings :: struct {
 	fullscreen:   bool,
 }
 
-settings_dir: string // "" when $HOME (%USERPROFILE% on Windows) isn't set: nothing is loaded or saved
-settings_path: string
 
 pics: [dynamic]Picture
 texs: []Tile_Tex
 loaded: [dynamic]int // pictures whose texture is Ready
-loader: Loader
 frame: u64
 generation: u64 = 1 // bumped when thumbnails must be redone (lane size or direction changed)
 // Lane sizes in physical pixels, rounded up, for both kinds of lane: thumbnails
@@ -500,41 +323,28 @@ lightbox: struct {
 }
 lightbox_seq: u64
 
-main :: proc() {
-	// Flags override the saved settings, and get saved along with them.
-	saved := load_settings()
-	parse_args()
-	heif_init(nil)
-	scan()
-	if len(pics) == 0 {
-		fmt.eprintfln("scrolld: no images found in %s%s", opts.dir, opts.recursive ? "" : " (try --recursive)")
-		os.exit(1)
-	}
+layout_rows, layout_tilted: bool // what the layout and the tile filters were last set up for
+saved_settings: Settings
+
+// Opens the window and sets up everything else, once main has loaded the
+// settings and scan has found the images.
+init :: proc() {
 	if !opts.shuffle {
 		slice.sort_by(pics[:], proc(a, b: Picture) -> bool {return a.name < b.name})
 	}
 	fmt.printfln("scrolld: %d images from %s", len(pics), opts.dir)
 
 	texs = make([]Tile_Tex, len(pics))
-	loader.wanted = make([]u64, len(pics))
 	perm = make([]int, len(pics))
 	shuffle_seed = rand.uint64()
 
 	rl.SetTraceLogLevel(.WARNING)
 	rl.SetConfigFlags({.WINDOW_RESIZABLE, .WINDOW_HIGHDPI, .VSYNC_HINT, .MSAA_4X_HINT})
 	rl.InitWindow(1280, 800, "scrolld")
-	defer rl.CloseWindow()
 	rl.SetExitKey(.KEY_NULL)
 	if fullscreen do set_fullscreen(true)
 
-	// macOS windows have no icon of their own; there it comes from an app bundle.
-	when ODIN_OS != .Darwin {
-		icon := rl.LoadImageFromMemory(".png", raw_data(ICON_PNG), c.int(len(ICON_PNG)))
-		rl.SetWindowIcon(icon)
-		rl.UnloadImage(icon)
-	}
-
-	ui_font = rl.LoadFontEx(ODIN_OS == .Windows ? "C:/Windows/Fonts/arial.ttf" : "/System/Library/Fonts/Supplemental/Arial.ttf", 48, nil, 0)
+	ui_font = rl.LoadFontEx(UI_FONT, 48, nil, 0)
 	rl.SetTextureFilter(ui_font.texture, .BILINEAR)
 
 	tile_shader = rl.LoadShaderFromMemory(GRID_VS, TILE_FS)
@@ -554,142 +364,100 @@ main :: proc() {
 	clay.Initialize(arena, {1280, 800}, {handler = clay_error})
 	clay.SetMeasureTextFunction(measure_text, nil)
 
-	workers: [WORKERS]^thread.Thread
-	for &w in workers do w = thread.create_and_start(worker)
-	defer {
-		sync.mutex_lock(&loader.mutex)
-		loader.quit = true
-		sync.mutex_unlock(&loader.mutex)
-		sync.cond_broadcast(&loader.cond)
-		for w in workers {
-			thread.join(w)
-			thread.destroy(w)
-		}
-	}
-
-	layout_rows, layout_tilted := rows, tilted()
-	for !rl.WindowShouldClose() && !quit {
-		frame += 1
-		sync.atomic_store(&loader.frame, frame)
-		fullscreen = is_fullscreen() // also entered/left with the green button or ⌃⌘F
-		now := rl.GetTime()
-		dt := f64(rl.GetFrameTime())
-		sw, sh := f64(rl.GetScreenWidth()), f64(rl.GetScreenHeight())
-
-		_, screen_len := screen_extent(sw, sh)
-		handle_keys(screen_len)
-
-		// Clay handles the top bar and angle panel while building the layout.
-		clay.SetLayoutDimensions({f32(sw), f32(sh)})
-		clay.SetPointerState(rl.GetMousePosition(), rl.IsMouseButtonDown(.LEFT))
-		commands := build_ui(sw, sh)
-
-		// Keys, buttons and sliders above may have changed the direction or angle.
-		rows = int(image_rotation()) % 180 != 0
-		across, _ := screen_extent(sw, sh)
-		update_plane(sw, sh)
-		update_thumb_sizes(sw, sh)
-		if tilted() != layout_tilted || rows != layout_rows {
-			layout_tilted = tilted()
-			for pic in loaded do set_tile_filter(pic)
-		}
-
-		// Changing the angle only adds or drops lanes at the sides, which leaves
-		// the rest where they were.
-		n, size, side := lane_geometry(across)
-		if rows != layout_rows || n != lanes || size != lane_size || side != side_lanes {
-			relayout(n, size, side)
-			layout_rows = rows
-		}
-
-		if !lightbox.open {
-			wheel := rl.GetMouseWheelMoveV()
-			scroll -= f64(rows ? wheel.y + wheel.x : wheel.y) * 40
-			// Diagonally, scroll is only the part along the lanes.
-			if autoscroll do scroll += speed * dt * (diagonal() ? 1 / math.SQRT_TWO : 1)
-		}
-		// At the start, the first tiles are just inside the trailing edge of the
-		// wall on screen, below the bar when that's the top of a flat one.
-		lead := GAP + (direction == .N && !tilted() && !ui_hidden ? BAR_H : 0)
-		scroll = max(scroll, -plane.lo.y - lead)
-
-		// Content y range of the part of the wall on screen.
-		view_top, view_len := scroll + plane.lo.y, plane.hi.y - plane.lo.y
-		extend_layout(view_top + view_len * 4)
-		update_textures(view_top, view_len)
-		process_results(now)
-		evict()
-
-		hovered := handle_pointer(sw, sh)
-
-		rl.BeginDrawing()
-		rl.ClearBackground(BG)
-		draw_wall(view_top, view_len, hovered, now)
-		render_clay(&commands)
-		rl.EndDrawing()
-
-		// Not mid-drag, which would write the file every frame.
-		adjusting := (drag.moved && angle_open) || active_slider != 0
-		if s := current_settings(); s != saved && !adjusting {
-			save_settings(s)
-			saved = s
-		}
-
-		free_all(context.temp_allocator)
-	}
+	layout_rows, layout_tilted = rows, tilted()
 }
 
-parse_args :: proc() {
-	for arg in os.args[1:] {
-		switch arg {
-		case "-r", "--recursive":
-			opts.recursive = true
-		case "-s", "--shuffle":
-			opts.shuffle = true
-		case "-x", "--sideways":
-			direction = .E
-		case "-c", "--crawl":
-			tilt_x = CRAWL_TILT
-		case "-h", "--help":
-			fmt.println(USAGE)
-			os.exit(0)
-		case:
-			if strings.has_prefix(arg, "-") {
-				fmt.eprintfln("scrolld: unknown option %s\n\n%s", arg, USAGE)
-				os.exit(2)
-			}
-			opts.dir = arg
-		}
+update_frame :: proc() {
+	frame += 1
+	loader_begin_frame()
+	fullscreen = is_fullscreen() // also entered/left with the green button or ⌃⌘F
+	now := rl.GetTime()
+	dt := f64(rl.GetFrameTime())
+	sw, sh := f64(rl.GetScreenWidth()), f64(rl.GetScreenHeight())
+
+	_, screen_len := screen_extent(sw, sh)
+	handle_keys(screen_len)
+
+	// Clay handles the top bar and angle panel while building the layout.
+	clay.SetLayoutDimensions({f32(sw), f32(sh)})
+	clay.SetPointerState(rl.GetMousePosition(), rl.IsMouseButtonDown(.LEFT))
+	commands := build_ui(sw, sh)
+
+	// Keys, buttons and sliders above may have changed the direction or angle.
+	rows = int(image_rotation()) % 180 != 0
+	across, _ := screen_extent(sw, sh)
+	update_plane(sw, sh)
+	update_thumb_sizes(sw, sh)
+	if tilted() != layout_tilted || rows != layout_rows {
+		layout_tilted = tilted()
+		for pic in loaded do set_tile_filter(pic)
 	}
-	abs, err := os.get_absolute_path(opts.dir == "" ? "." : opts.dir, context.allocator)
-	if err != nil || !os.is_dir(abs) {
-		fmt.eprintfln("scrolld: not a directory: %s", opts.dir)
-		os.exit(1)
+
+	// Changing the angle only adds or drops lanes at the sides, which leaves
+	// the rest where they were.
+	n, size, side := lane_geometry(across)
+	if rows != layout_rows || n != lanes || size != lane_size || side != side_lanes {
+		relayout(n, size, side)
+		layout_rows = rows
 	}
-	opts.dir = abs
+
+	if !lightbox.open {
+		wheel := rl.GetMouseWheelMoveV()
+		scroll -= f64(rows ? wheel.y + wheel.x : wheel.y) * 40
+		// Diagonally, scroll is only the part along the lanes.
+		if autoscroll do scroll += speed * dt * (diagonal() ? 1 / math.SQRT_TWO : 1)
+	}
+	// At the start, the first tiles are just inside the trailing edge of the
+	// wall on screen, below the bar when that's the top of a flat one.
+	lead := GAP + (direction == .N && !tilted() && !ui_hidden ? BAR_H : 0)
+	scroll = max(scroll, -plane.lo.y - lead)
+
+	// Content y range of the part of the wall on screen.
+	view_top, view_len := scroll + plane.lo.y, plane.hi.y - plane.lo.y
+	extend_layout(view_top + view_len * 4)
+	update_textures(view_top, view_len)
+	process_results(now)
+	evict()
+
+	hovered := handle_pointer(sw, sh)
+
+	rl.BeginDrawing()
+	rl.ClearBackground(BG)
+	draw_wall(view_top, view_len, hovered, now)
+	render_clay(&commands)
+	rl.EndDrawing()
+
+	// Not mid-drag, which would write the file every frame.
+	adjusting := (drag.moved && angle_open) || active_slider != 0
+	if s := current_settings(); s != saved_settings && !adjusting {
+		save_settings(s)
+		saved_settings = s
+	}
+
+	free_all(context.temp_allocator)
 }
 
 // --- Settings ----------------------------------------------------------------
 
-// Reads `key = value` lines from ~/.scrolld/settings into the globals. Blank
-// lines and `#` comments are skipped; a bad line is reported and ignored.
-// Returns what was loaded, so main can tell when something changes.
-load_settings :: proc() -> Settings {
+// Applies one of the options both builds take (see USAGE in desktop.odin),
+// or returns false.
+apply_flag :: proc(arg: string) -> bool {
+	switch arg {
+	case "-r", "--recursive": opts.recursive = true
+	case "-s", "--shuffle":   opts.shuffle = true
+	case "-x", "--sideways":  direction = .E
+	case "-c", "--crawl":     tilt_x = CRAWL_TILT
+	case:                     return false
+	}
+	return true
+}
+
+// Reads `key = value` lines into the globals. Blank lines and `#` comments are
+// skipped; a bad line is reported, as source:line, and ignored.
+parse_settings :: proc(text: string, source: string) {
 	set_bool :: proc(dst: ^bool, s: string) -> bool {
 		dst^ = strconv.parse_bool(s) or_return
 		return true
-	}
-
-	defer free_all(context.temp_allocator)
-	home := os.get_env(ODIN_OS == .Windows ? "USERPROFILE" : "HOME", context.temp_allocator)
-	if home == "" do return current_settings()
-	settings_dir = strings.concatenate({home, "/.scrolld"})
-	settings_path = strings.concatenate({settings_dir, "/settings"})
-
-	data, err := os.read_entire_file(settings_path, context.temp_allocator)
-	if err != nil {
-		if err != .Not_Exist do fmt.eprintfln("scrolld: can't read %s: %v", settings_path, err)
-		return current_settings()
 	}
 
 	set_angle :: proc(dst: ^f64, s: string, lo, hi: f64) -> bool {
@@ -701,7 +469,7 @@ load_settings :: proc() -> Settings {
 	// crawl went; they're turned into a direction and tilt below.
 	old_mode, old_toward := "", false
 
-	text := string(data)
+	text := text
 	line_no := 0
 	for line in strings.split_lines_iterator(&text) {
 		line_no += 1
@@ -709,7 +477,7 @@ load_settings :: proc() -> Settings {
 		if line == "" || strings.has_prefix(line, "#") do continue
 		eq := strings.index_byte(line, '=')
 		if eq < 0 {
-			fmt.eprintfln("scrolld: %s:%d: expected key = value", settings_path, line_no)
+			fmt.eprintfln("scrolld: %s:%d: expected key = value", source, line_no)
 			continue
 		}
 		key, value := strings.trim_space(line[:eq]), strings.trim_space(line[eq + 1:])
@@ -739,10 +507,10 @@ load_settings :: proc() -> Settings {
 		case "autoscroll": ok = set_bool(&autoscroll, value)
 		case "fullscreen": ok = set_bool(&fullscreen, value)
 		case:
-			fmt.eprintfln("scrolld: %s:%d: unknown setting %s", settings_path, line_no, key)
+			fmt.eprintfln("scrolld: %s:%d: unknown setting %s", source, line_no, key)
 			continue
 		}
-		if !ok do fmt.eprintfln("scrolld: %s:%d: bad value for %s: %s", settings_path, line_no, key, value)
+		if !ok do fmt.eprintfln("scrolld: %s:%d: bad value for %s: %s", source, line_no, key, value)
 	}
 
 	switch old_mode {
@@ -750,7 +518,6 @@ load_settings :: proc() -> Settings {
 	case "sideways": direction = .E
 	case "crawl":    direction, tilt_x = old_toward ? .S : .N, CRAWL_TILT
 	}
-	return current_settings()
 }
 
 current_settings :: proc() -> Settings {
@@ -769,10 +536,8 @@ current_settings :: proc() -> Settings {
 	}
 }
 
-// Writes to a temp file and renames it over the old one, so a crash mid-write
-// can't leave a truncated file.
-save_settings :: proc(s: Settings) {
-	if settings_dir == "" do return
+// The settings as parse_settings reads them, in the temp allocator.
+format_settings :: proc(s: Settings) -> string {
 	b := strings.builder_make(context.temp_allocator)
 	fmt.sbprintln(&b, "# scrolld settings, saved whenever they change in the app")
 	fmt.sbprintln(&b, "# direction: n, ne, e, se, s, sw, w or nw; angles in degrees; lanes: 0 = auto")
@@ -786,89 +551,7 @@ save_settings :: proc(s: Settings) {
 	fmt.sbprintfln(&b, "ui_hidden = %v", s.ui_hidden)
 	fmt.sbprintfln(&b, "autoscroll = %v", s.autoscroll)
 	fmt.sbprintfln(&b, "fullscreen = %v", s.fullscreen)
-
-	tmp := strings.concatenate({settings_path, ".tmp"}, context.temp_allocator)
-	err := os.make_directory(settings_dir)
-	if err == .Exist do err = nil
-	if err == nil do err = os.write_entire_file(tmp, strings.to_string(b))
-	if err == nil do err = os.rename(tmp, settings_path)
-	if err != nil do fmt.eprintfln("scrolld: can't save %s: %v", settings_path, err)
-}
-
-// Finds images and reads their dimensions from the file header only.
-scan :: proc() {
-	walker := os.walker_create(opts.dir)
-	defer os.walker_destroy(&walker)
-	webp_header := make([]u8, 64 * 1024)
-	defer delete(webp_header)
-
-	for info in os.walker_walk(&walker) {
-		if _, err := os.walker_error(&walker); err != nil do continue
-		if info.type == .Directory {
-			if !opts.recursive || strings.has_prefix(info.name, ".") do os.walker_skip_dir(&walker)
-			continue
-		}
-		if strings.has_prefix(info.name, ".") do continue
-		ext := strings.to_lower(os.ext(info.name), context.temp_allocator)
-		if !slice.contains(IMAGE_EXTS[:], ext) do continue
-
-		path := strings.clone_to_cstring(info.fullpath)
-		format: Format
-		switch ext {
-		case ".jpg", ".jpeg":  if TURBOJPEG do format = .Jpeg
-		case ".webp":          format = .Webp
-		case ".heic", ".heif": format = .Heif
-		}
-		w, h, comp: c.int
-		ok: bool
-		switch format {
-		case .Stb, .Jpeg: ok = stbi.info(path, &w, &h, &comp) != 0
-		case .Webp:       ok = webp_info(info.fullpath, webp_header, &w, &h)
-		case .Heif:       ok = heif_info(path, &w, &h)
-		}
-		if !ok || w <= 0 || h <= 0 {
-			delete(path)
-			continue
-		}
-		name := strings.clone(strings.trim_prefix(strings.trim_prefix(info.fullpath, opts.dir), "/"))
-		append(&pics, Picture{path = path, name = name, width = w, height = h, format = format})
-	}
-	free_all(context.temp_allocator)
-}
-
-// Reads WebP dimensions from the start of the file, falling back to the whole
-// file when metadata chunks (ICC, EXIF) push the image header further in.
-// Animated WebPs are skipped: decoding them needs libwebpdemux.
-webp_info :: proc(path: string, buf: []u8, w, h: ^c.int) -> bool {
-	f, err := os.open(path)
-	if err != nil do return false
-	n, _ := os.read(f, buf)
-	os.close(f)
-
-	features: WebP_Features
-	status := WebPGetFeaturesInternal(raw_data(buf), c.size_t(n), &features, WEBP_DECODER_ABI_VERSION)
-	if status == WEBP_STATUS_NOT_ENOUGH_DATA && n == len(buf) {
-		data, read_err := os.read_entire_file(path, context.allocator)
-		if read_err != nil do return false
-		defer delete(data)
-		status = WebPGetFeaturesInternal(raw_data(data), c.size_t(len(data)), &features, WEBP_DECODER_ABI_VERSION)
-	}
-	if status != 0 || features.has_animation != 0 do return false
-	w^, h^ = features.width, features.height
-	return true
-}
-
-// Reads the primary image's size from the HEIF container, without decoding it.
-// It's the size after rotation, which decoding also applies.
-heif_info :: proc(path: cstring, w, h: ^c.int) -> bool {
-	ctx := heif_context_alloc()
-	defer heif_context_free(ctx)
-	if heif_context_read_from_file(ctx, path, nil).code != 0 do return false
-	handle: ^Heif_Handle
-	if heif_context_get_primary_image_handle(ctx, &handle).code != 0 do return false
-	defer heif_image_handle_release(handle)
-	w^, h^ = heif_image_handle_get_width(handle), heif_image_handle_get_height(handle)
-	return true
+	return strings.to_string(b)
 }
 
 // --- Layout ------------------------------------------------------------------
@@ -1080,170 +763,10 @@ placement_at :: proc(mouse: rl.Vector2) -> int {
 
 // --- Image loading -------------------------------------------------------------
 
-worker :: proc() {
-	for {
-		sync.mutex_lock(&loader.mutex)
-		for len(loader.jobs) == 0 && !loader.quit do sync.cond_wait(&loader.cond, &loader.mutex)
-		if loader.quit {
-			sync.mutex_unlock(&loader.mutex)
-			return
-		}
-		job := pop_front(&loader.jobs)
-		sync.mutex_unlock(&loader.mutex)
-
-		res := Result{job = job}
-		if !job.lightbox && sync.atomic_load(&loader.frame) > sync.atomic_load(&loader.wanted[job.pic]) + 30 {
-			res.status = .Skipped
-		} else {
-			// CPU-only work is safe off the main thread; GPU upload is not.
-			pic := pics[job.pic]
-			// The JPEG, WebP and HEIF decoders shrink to about target_w themselves.
-			switch pic.format {
-			case .Stb:  res.image = load_image(pic.path)
-			case .Jpeg: when TURBOJPEG do res.image = load_jpeg(pic.path, job.target_w)
-			case .Webp: res.image = load_webp(string(pic.path), job.target_w)
-			case .Heif: res.image = load_heif(pic.path, job.target_w)
-			}
-			if res.image.data == nil {
-				res.status = .Failed
-			} else if res.image.width > job.target_w {
-				w, h := shrunk(res.image.width, res.image.height, job.target_w)
-				rl.ImageResize(&res.image, w, h)
-			}
-		}
-
-		sync.mutex_lock(&loader.mutex)
-		append(&loader.results, res)
-		sync.mutex_unlock(&loader.mutex)
-	}
-}
-
-// Decodes with stb_image into a raylib Image. Both use the C heap, so raylib
-// can resize and free it.
-load_image :: proc(path: cstring) -> rl.Image {
-	w, h, channels: c.int
-	data := stbi.load(path, &w, &h, &channels, 0)
-	if data == nil do return {}
-	format: rl.PixelFormat
-	switch channels {
-	case 1: format = .UNCOMPRESSED_GRAYSCALE
-	case 2: format = .UNCOMPRESSED_GRAY_ALPHA
-	case 3: format = .UNCOMPRESSED_R8G8B8
-	case:   format = .UNCOMPRESSED_R8G8B8A8
-	}
-	return {data = data, width = w, height = h, mipmaps = 1, format = format}
-}
-
 // The size of a w x h image shrunk to at most max_w wide.
 shrunk :: proc(w, h, max_w: c.int) -> (c.int, c.int) {
 	if w <= max_w do return w, h
 	return max_w, max(c.int(f64(h) * f64(max_w) / f64(w)), 1)
-}
-
-when TURBOJPEG {
-	// Decodes at the smallest scale libjpeg-turbo offers that's at least
-	// target_w wide, leaving the rest to the worker's resize. JPEGs it can't
-	// decode (CMYK, 12-bit...) go to stb_image.
-	load_jpeg :: proc(path: cstring, target_w: i32) -> rl.Image {
-		scaled :: proc(dim: c.int, f: Tj_Scaling_Factor) -> c.int {return (dim * f.num + f.denom - 1) / f.denom}
-
-		data, err := os.read_entire_file(string(path), context.allocator)
-		if err != nil do return {}
-		defer delete(data)
-		tj := tj3Init(TJINIT_DECOMPRESS)
-		if tj == nil do return load_image(path)
-		defer tj3Destroy(tj)
-		if tj3DecompressHeader(tj, raw_data(data), c.size_t(len(data))) != 0 do return load_image(path)
-		jw, jh := tj3Get(tj, TJPARAM_JPEGWIDTH), tj3Get(tj, TJPARAM_JPEGHEIGHT)
-
-		n: c.int
-		factors := tj3GetScalingFactors(&n)
-		best := Tj_Scaling_Factor{1, 1}
-		for f in factors[:n] {
-			sw := scaled(jw, f)
-			if f.num < f.denom && sw >= target_w && sw < scaled(jw, best) do best = f
-		}
-		if tj3SetScalingFactor(tj, best) != 0 do return load_image(path)
-
-		w, h := scaled(jw, best), scaled(jh, best)
-		pixels := ([^]u8)(libc.malloc(c.size_t(w) * c.size_t(h) * 3))
-		if pixels == nil do return {}
-		// A warning means it's damaged but decoded what it could, as stb_image does.
-		if tj3Decompress8(tj, raw_data(data), c.size_t(len(data)), pixels, 0, TJPF_RGB) != 0 && tj3GetErrorCode(tj) != TJERR_WARNING {
-			libc.free(pixels)
-			return load_image(path)
-		}
-		return {data = pixels, width = w, height = h, mipmaps = 1, format = .UNCOMPRESSED_R8G8B8}
-	}
-}
-
-// Decodes straight to target_w wide when that's smaller, into a malloc'd
-// buffer raylib can free.
-load_webp :: proc(path: string, target_w: i32) -> rl.Image {
-	data, err := os.read_entire_file(path, context.allocator)
-	if err != nil do return {}
-	defer delete(data)
-	config: WebP_Decoder_Config
-	if WebPInitDecoderConfigInternal(&config, WEBP_DECODER_ABI_VERSION) == 0 do return {}
-	if WebPGetFeaturesInternal(raw_data(data), c.size_t(len(data)), &config.input, WEBP_DECODER_ABI_VERSION) != 0 do return {}
-
-	w, h := shrunk(config.input.width, config.input.height, target_w)
-	if w != config.input.width {
-		config.options.use_scaling, config.options.scaled_width, config.options.scaled_height = 1, w, h
-	}
-	row := c.size_t(w) * 4
-	pixels := ([^]u8)(libc.malloc(row * c.size_t(h)))
-	if pixels == nil do return {}
-	config.output.colorspace = WEBP_MODE_RGBA
-	config.output.is_external_memory = 1
-	config.output.rgba, config.output.stride, config.output.size = pixels, c.int(row), row * c.size_t(h)
-	if WebPDecode(raw_data(data), c.size_t(len(data)), &config) != 0 {
-		libc.free(pixels)
-		return {}
-	}
-	return {data = pixels, width = w, height = h, mipmaps = 1, format = .UNCOMPRESSED_R8G8B8A8}
-}
-
-// libheif owns its pixels, so they're copied (dropping any row padding) into a
-// malloc'd buffer raylib can free, shrunk to target_w on the way when they're
-// wider, so there's never a second full-size copy.
-load_heif :: proc(path: cstring, target_w: i32) -> rl.Image {
-	ctx := heif_context_alloc()
-	defer heif_context_free(ctx)
-	if heif_context_read_from_file(ctx, path, nil).code != 0 do return {}
-	handle: ^Heif_Handle
-	if heif_context_get_primary_image_handle(ctx, &handle).code != 0 do return {}
-	defer heif_image_handle_release(handle)
-	img: ^Heif_Image
-	if heif_decode_image(handle, &img, HEIF_COLORSPACE_RGB, HEIF_CHROMA_INTERLEAVED_RGBA, nil).code != 0 do return {}
-	defer heif_image_release(img)
-
-	w := heif_image_get_width(img, HEIF_CHANNEL_INTERLEAVED)
-	h := heif_image_get_height(img, HEIF_CHANNEL_INTERLEAVED)
-	stride: c.size_t
-	src := heif_image_get_plane_readonly2(img, HEIF_CHANNEL_INTERLEAVED, &stride)
-	row := c.size_t(w) * 4
-	if src == nil || w <= 0 || h <= 0 || stride < row do return {}
-	ow, oh := shrunk(w, h, target_w)
-	pixels := ([^]u8)(libc.malloc(c.size_t(ow) * c.size_t(oh) * 4))
-	if pixels == nil do return {}
-	if ow == w {
-		for y in 0 ..< c.size_t(h) {
-			libc.memcpy(pixels[y * row:], src[y * stride:], row)
-		}
-	} else if stbi.resize_uint8(src, w, h, c.int(stride), pixels, ow, oh, 0, 4) == 0 {
-		libc.free(pixels)
-		return {}
-	}
-	return {data = pixels, width = ow, height = oh, mipmaps = 1, format = .UNCOMPRESSED_R8G8B8A8}
-}
-
-enqueue :: proc(job: Job, front := false) {
-	sync.mutex_lock(&loader.mutex)
-	if front do inject_at(&loader.jobs, 0, job)
-	else do append(&loader.jobs, job)
-	sync.mutex_unlock(&loader.mutex)
-	sync.cond_signal(&loader.cond)
 }
 
 // Marks pictures between content y0 and y1 as in use, and optionally queues
@@ -1255,7 +778,7 @@ mark_range :: proc(y0, y1: f64, request: bool) {
 		if p.y + p.h < y0 || !in_view(p) do continue
 		t := &texs[p.pic]
 		t.used = frame
-		sync.atomic_store(&loader.wanted[p.pic], frame)
+		want(p.pic)
 		if request && t.state == .Empty {
 			t.state = .Loading
 			enqueue({pic = p.pic, target_w = thumb_width(p.pic), generation = generation})
@@ -1279,18 +802,11 @@ update_textures :: proc(view_top, view_h: f64) {
 process_results :: proc(now: f64) {
 	uploads := 0
 	for uploads < MAX_UPLOADS_PER_FRAME {
-		sync.mutex_lock(&loader.mutex)
-		if len(loader.results) == 0 {
-			sync.mutex_unlock(&loader.mutex)
-			break
-		}
-		r := pop_front(&loader.results)
-		sync.mutex_unlock(&loader.mutex)
-
-		defer rl.UnloadImage(r.image)
+		r := next_result() or_break
+		defer release(r.image)
 		if r.job.lightbox {
 			if lightbox.open && r.job.generation == lightbox.id && r.status == .Ok {
-				lightbox.tex = rl.LoadTextureFromImage(r.image)
+				lightbox.tex = upload(r.image)
 				rl.SetTextureFilter(lightbox.tex, .BILINEAR)
 				uploads += 1
 			}
@@ -1305,7 +821,7 @@ process_results :: proc(now: f64) {
 		case .Failed:
 			t.state = .Failed
 		case .Ok:
-			t.tex = rl.LoadTextureFromImage(r.image)
+			t.tex = upload(r.image)
 			set_tile_filter(r.job.pic)
 			t.state = .Ready
 			t.ready_at = now
@@ -1350,9 +866,7 @@ reset_textures :: proc() {
 	for pic in loaded do rl.UnloadTexture(texs[pic].tex)
 	clear(&loaded)
 	slice.zero(texs)
-	sync.mutex_lock(&loader.mutex)
-	for len(loader.jobs) > 0 && !loader.jobs[len(loader.jobs) - 1].lightbox do pop(&loader.jobs)
-	sync.mutex_unlock(&loader.mutex)
+	drop_queued_thumbnails()
 }
 
 // --- Lightbox ----------------------------------------------------------------

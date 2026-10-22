@@ -9,6 +9,15 @@ build: deps
 run *args: build
     ./bin/scrolld{{exe}} {{args}}
 
+# Builds the web version into bin/web, with the images in dir, ready to serve
+# with `python3 -m http.server -d bin/web`. Homebrew's Odin needs wasm-ld from
+# its lld dependency, which isn't on PATH.
+web dir:
+    mkdir -p bin/web
+    PATH="$(dirname "$(command -v wasm-ld || ls /opt/homebrew/opt/lld*/bin/wasm-ld | tail -1)"):$PATH" odin build . -target:js_wasm32 -define:RAYLIB_WASM_LIB=raylib -o:speed -out:bin/web/scrolld.wasm
+    cp web/index.html web/raylib.js web/scrolld.js icon.png "$(odin root)/core/sys/wasm/js/odin.js" bin/web/
+    odin run web/manifest -- "{{dir}}" bin/web/images
+
 webp_version := "1.6.0"
 webp_sha256 := "48886f506b21f62e4661f0f4cbfca19800897c385128e8902542d29a950c93f1"
 
