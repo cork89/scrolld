@@ -3,14 +3,15 @@
 // Build:  just build   (odin build . -define:RAYLIB_SHARED=true -o:speed -out:bin/scrolld)
 // Run:    ./bin/scrolld [dir] [-r] [-s] [-x]
 //
-// The grid is drawn directly with raylib; Clay lays out the top bar and the
-// full-size viewer. The wall scrolls down in columns, right in rows (sideways),
-// or away into the distance (crawl: the column grid is drawn on a tilted 3D
-// plane, wide enough to fill the screen). Images are decoded and shrunk to lane size on worker
-// threads, uploaded to the GPU a few per frame, and unloaded once they're well
-// off screen, so memory stays flat no matter how long it scrolls.
+// The grid is drawn with raylib on a plane in 3D; Clay lays out the top bar,
+// the angle panel and the full-size viewer. The wall scrolls in any of eight
+// compass directions, and the plane can be tilted, turned and spun, with lanes
+// added past the screen's edges so it always fills the screen. Images are
+// decoded and shrunk to lane size on worker threads, uploaded to the GPU a few
+// per frame, and unloaded once they're well off screen, so memory stays flat no
+// matter how long it scrolls.
 //
-// Settings changed in the app (mode, speed, lanes...) are saved to
+// Settings changed in the app (direction, angle, speed, lanes...) are saved to
 // ~/.scrolld/settings whenever they change, and loaded on the next launch.
 package main
 
@@ -19,6 +20,7 @@ import "core:c"
 import "core:c/libc"
 import "core:fmt"
 import "core:math"
+import "core:math/linalg"
 import "core:math/rand"
 import "core:os"
 import "core:slice"
@@ -26,6 +28,7 @@ import "core:strconv"
 import "core:strings"
 import "core:sync"
 import "core:thread"
+import "core:unicode/utf8"
 import rl "vendor:raylib"
 import rlgl "vendor:raylib/rlgl"
 import stbi "vendor:stb/image"
@@ -108,24 +111,27 @@ auto-scrolling masonry wall that wraps around forever.
 Options:
   -r, --recursive   Include images in subdirectories
   -s, --shuffle     Random order (a new order on each pass)
-  -x, --sideways    Start in sideways mode (rows scrolling right)
-  -c, --crawl       Start in crawl mode (a tilted wall receding into the distance)
+  -x, --sideways    Start scrolling right (rows)
+  -c, --crawl       Start tilted back, receding into the distance
   -h, --help        Show this help
 
 Keys:
   Space       Start / pause auto scroll
   + / -       Faster / slower
-  [ / ]       Fewer / more columns or rows (0 = auto)
-  D           Cycle vertical / sideways / crawl
-  R           Crawl away from / toward you
+  [ / ]       Fewer / more lanes (0 = auto)
+  D           Next direction, clockwise
+  A           Show / hide the angle panel
+  R           Reset the angle to flat
   Wheel, arrows, PgUp/PgDn   Scroll manually
   Click       Open full size (Esc or click to close)
+  Drag        Rotate the wall, while the angle panel is open
+              (Shift: one axis at a time, Ctrl or Cmd: spin)
   F           Toggle fullscreen
   H, ☰ button Hide / show the top bar
   Esc, Q      Quit
 
-Mode, speed, lanes, fullscreen, auto scroll and the top bar are remembered
-in ~/.scrolld/settings. Options above override them for a run.`
+Direction, angle, speed, lanes, fullscreen, auto scroll and the top bar are
+remembered in ~/.scrolld/settings. Options above override them for a run.`
 
 GAP :: 10.0
 BAR_H :: 56.0
@@ -133,27 +139,32 @@ MIN_COL_W :: 280.0
 MIN_ROW_H :: 220.0
 WORKERS :: 4
 MAX_UPLOADS_PER_FRAME :: 4
+EVICT_AFTER_FRAMES :: 180
 SPEED_STEP :: 20.0
 FADE_IN_SECS :: 0.25
 TILE_RADIUS :: 8.0
 CAPTION_H :: 40.0
 
-// Crawl mode. World units are logical pixels * CRAWL_UNIT, keeping the plane
-// inside raylib's default clip distances.
-CRAWL_UNIT :: 0.01
-CRAWL_FOVY :: 45.0
-CRAWL_TILT :: 62.0 // degrees back from facing the camera
-CRAWL_SCREENS :: 5.0 // plane length, in screen heights
+// The wall is a plane through the middle of the screen, seen from the distance
+// where it exactly fills the screen when flat. World units are logical pixels *
+// PLANE_UNIT, keeping it inside raylib's default clip distances.
+PLANE_UNIT :: 0.01
+PLANE_FAR :: 4.4 // how far behind the screen the wall has faded out, in screen heights
+MAX_TILT :: 75.0
+MAX_SIDE_LANES :: 40
+DEFAULT_FOV :: 45.0
+CRAWL_TILT :: 62.0 // the Crawl preset
+DRAG_DEGREES_PER_PX :: 0.3
 
-// raylib's default vertex shader, plus how far along the crawl plane each
-// vertex is (0 at the near edge, 1 at the far end) for the fade. rlgl applies
-// the plane's transform on the CPU, so vertexPosition is already in world space.
+// raylib's default vertex shader, plus how far behind the screen each vertex
+// is (0 at the screen, 1 where the wall has faded out). rlgl applies the
+// plane's transform on the CPU, so vertexPosition is already in world space.
 GRID_VS :: `#version 330
 in vec3 vertexPosition;
 in vec2 vertexTexCoord;
 in vec4 vertexColor;
 uniform mat4 mvp;
-uniform float fadeDepth; // world depth of the far end, 0 = no fade
+uniform float fadeDepth; // world depth where the wall has faded out, 0 = no fade
 out vec2 fragTexCoord;
 out vec4 fragColor;
 out float fragFar;
@@ -165,7 +176,7 @@ void main() {
 	gl_Position = mvp * vec4(vertexPosition, 1.0);
 }`
 
-// Placeholders: fades the far end of the crawl plane into the background.
+// Placeholders: fades the far end of the wall into the background.
 FADE_FS :: `#version 330
 in vec2 fragTexCoord;
 in vec4 fragColor;
@@ -182,7 +193,7 @@ void main() {
 // Rounds a tile's corners with an antialiased rounded-rect distance field, and
 // darkens its bottom edge behind the hover caption so that stays inside the
 // corners too. The edge is antialiased over one screen pixel, however small
-// the tile is drawn, and fades like FADE_FS in crawl mode.
+// the tile is drawn, and fades like FADE_FS.
 TILE_FS :: `#version 330
 in vec2 fragTexCoord;
 in vec4 fragColor;
@@ -250,13 +261,15 @@ Tile_Tex :: struct {
 	used:     u64, // last frame it was near the viewport
 }
 
-// Placements live in lane space: `x`/`w` run across the lanes (columns, or rows
-// when sideways) and `y`/`h` along the scroll direction; tile_rect maps them to
-// the screen. They're generated in order and `y` never decreases, because each
+// Placements live in lane space: `x`/`w` run across the lanes and `y`/`h` along
+// the scroll direction, with the lanes centered on x = 0; the plane maps them
+// onto the screen. They're generated in order and `y` never decreases, because each
 // one goes into the currently shortest lane. That lets us binary search for
 // the visible range.
 Placement :: struct {
 	pic:        int,
+	block:      int, // see extend_layout
+	k:          int, // the block's k-th tile
 	x, y, w, h: f64,
 }
 
@@ -289,16 +302,45 @@ Loader :: struct {
 	wanted:  []u64, // atomic, per picture: last frame it was in range
 }
 
-Mode :: enum {
-	Vertical,
-	Sideways,
-	Crawl,
+// Which way the content moves on screen, clockwise from up in 45° steps.
+Direction :: enum {
+	N,
+	NE,
+	E,
+	SE,
+	S,
+	SW,
+	W,
+	NW,
 }
 
-MODE_NAMES := [Mode]string {
-	.Vertical = "vertical",
-	.Sideways = "sideways",
-	.Crawl    = "crawl",
+DIRECTION_NAMES := [Direction]string {
+	.N  = "n",
+	.NE = "ne",
+	.E  = "e",
+	.SE = "se",
+	.S  = "s",
+	.SW = "sw",
+	.W  = "w",
+	.NW = "nw",
+}
+
+// How lane space lands on the screen, worked out each frame from the
+// direction and angle.
+Plane :: struct {
+	// World vectors for one logical pixel along lane x and y, and the plane's
+	// normal at the same scale. Lane space is centered on the screen at scroll.
+	a, b, n:    [3]f64,
+	cam:        rl.Camera3D,
+	fade_depth: f64, // world depth behind the screen where the wall has faded out
+	// The part of the wall on screen, as a convex polygon in lane space
+	// relative to scroll, and its bounds.
+	poly:       [16][2]f64,
+	poly_n:     int,
+	lo, hi:     [2]f64,
+	// Each edge's normal, and the polygon's extent along it.
+	axes:       [16][2]f64,
+	spans:      [16][2]f64,
 }
 
 opts: struct {
@@ -309,8 +351,11 @@ opts: struct {
 
 // What's saved to the settings file; compared each frame to spot changes.
 Settings :: struct {
-	mode:         Mode,
-	crawl_toward: bool,
+	direction:    Direction,
+	tilt_x:       f64,
+	tilt_y:       f64,
+	spin:         f64,
+	fov:          f64,
 	speed:        f64,
 	lanes:        int,
 	ui_hidden:    bool,
@@ -327,18 +372,27 @@ loaded: [dynamic]int // pictures whose texture is Ready
 loader: Loader
 frame: u64
 generation: u64 = 1 // bumped when thumbnails must be redone (lane size or direction changed)
-thumb_px: i32 // lane size in physical pixels, rounded up
-thumb_sideways: bool
+// Lane sizes in physical pixels, rounded up, for both kinds of lane: thumbnails
+// are decoded big enough for either, so changing direction doesn't reload them.
+thumb_px: i32 // column width
+thumb_row_px: i32 // row height
+
+// Direction and angle. Tilt X leans the top of the wall away, tilt Y the right
+// side, and spin turns it clockwise within its own plane; all in degrees.
+direction: Direction
+tilt_x, tilt_y, spin: f64
+fov := DEFAULT_FOV
+plane: Plane
 
 // Layout
-mode: Mode
-sideways := false // mode == .Sideways, kept as a flag since the layout code checks it everywhere
+rows := false // images turned a quarter turn in their lanes, so lanes are as tall as the images
 lanes_setting := 0 // 0 = auto
-lanes: int // across the screen
-side_lanes: int // extra lanes on each side, beyond the screen (crawl)
+lanes: int // across the screen, when flat
+side_lanes: int // extra lanes on each side, past the screen's edges
 lane_size: f64
-lane_origin: f64 // screen offset of the first lane (below the bar when sideways)
+lane_origin: f64 // lane-space x of the first lane's edge
 heights: [dynamic]f64
+block_counts: [dynamic]int // tiles placed in each block, leftmost first
 placements: [dynamic]Placement
 max_tile_h: f64
 shuffle_seed: u64
@@ -360,7 +414,13 @@ tile_locs: struct {
 fade_shader: rl.Shader
 fade_loc: c.int
 
-crawl_toward := false // content comes out of the distance toward you
+angle_open := false // the angle panel; dragging the wall rotates it while it's open
+active_slider: u32 // Clay id of the slider being dragged, 0 = none
+drag: struct {
+	down:        bool, // pressed on the wall (not the UI)
+	moved:       bool, // far enough to be a drag rather than a click
+	start, last: rl.Vector2,
+}
 
 lightbox: struct {
 	open:   bool,
@@ -434,7 +494,7 @@ main :: proc() {
 		}
 	}
 
-	layout_cross, layout_origin, layout_mode := -1.0, 0.0, mode
+	layout_rows, layout_tilted := rows, tilted()
 	for !rl.WindowShouldClose() && !quit {
 		frame += 1
 		sync.atomic_store(&loader.frame, frame)
@@ -443,61 +503,61 @@ main :: proc() {
 		dt := f64(rl.GetFrameTime())
 		sw, sh := f64(rl.GetScreenWidth()), f64(rl.GetScreenHeight())
 
-		// Along the scroll direction: the screen, or the whole crawl plane.
-		view_len := mode == .Sideways ? sw : mode == .Crawl ? crawl_length(sh) : sh
-		handle_keys(view_len)
+		_, screen_len := screen_extent(sw, sh)
+		handle_keys(screen_len)
 
-		// Clay handles the top bar buttons while building the layout.
+		// Clay handles the top bar and angle panel while building the layout.
 		clay.SetLayoutDimensions({f32(sw), f32(sh)})
 		clay.SetPointerState(rl.GetMousePosition(), rl.IsMouseButtonDown(.LEFT))
 		commands := build_ui(sw, sh)
 
-		// Keys and buttons above may have changed the mode.
-		sideways = mode == .Sideways
-		view_len = sideways ? sw : mode == .Crawl ? crawl_length(sh) : sh
+		// Keys, buttons and sliders above may have changed the direction or angle.
+		rows = int(image_rotation()) % 180 != 0
+		across, _ := screen_extent(sw, sh)
+		update_plane(sw, sh)
+		update_thumb_sizes(sw, sh)
+		if tilted() != layout_tilted || rows != layout_rows {
+			layout_tilted = tilted()
+			for pic in loaded do set_tile_filter(pic)
+		}
 
-		// Lanes span the width (columns), or the height below the bar (rows).
-		bar := ui_hidden ? 0 : BAR_H
-		cross, origin := sideways ? sh - bar : sw, sideways ? bar : 0
-		if cross != layout_cross || origin != layout_origin || mode != layout_mode || lane_count(cross) != lanes {
-			if (mode == .Crawl) != (layout_mode == .Crawl) {
-				for pic in loaded do set_tile_filter(&texs[pic].tex)
-			}
-			relayout(cross, origin)
-			layout_cross, layout_origin, layout_mode = cross, origin, mode
+		// Changing the angle only adds or drops lanes at the sides, which leaves
+		// the rest where they were.
+		n, size, side := lane_geometry(across)
+		if rows != layout_rows || n != lanes || size != lane_size || side != side_lanes {
+			relayout(n, size, side)
+			layout_rows = rows
 		}
 
 		if !lightbox.open {
 			wheel := rl.GetMouseWheelMoveV()
-			scroll -= f64(sideways ? wheel.y + wheel.x : wheel.y) * 40
-			if autoscroll do scroll += speed * dt
-			scroll = max(scroll, 0)
+			scroll -= f64(rows ? wheel.y + wheel.x : wheel.y) * 40
+			// Diagonally, scroll is only the part along the lanes.
+			if autoscroll do scroll += speed * dt * (diagonal() ? 1 / math.SQRT_TWO : 1)
 		}
+		// At the start, the first tiles are just inside the trailing edge of the
+		// wall on screen, below the bar when that's the top of a flat one.
+		lead := GAP + (direction == .N && !tilted() && !ui_hidden ? BAR_H : 0)
+		scroll = max(scroll, -plane.lo.y - lead)
 
-		view_top := scroll - content_lead() // content position at the screen's leading edge
+		// Content y range of the part of the wall on screen.
+		view_top, view_len := scroll + plane.lo.y, plane.hi.y - plane.lo.y
 		extend_layout(view_top + view_len * 4)
-		update_textures(view_top, view_len, sw, sh)
+		update_textures(view_top, view_len)
 		process_results(now)
 		evict()
 
-		if rl.IsMouseButtonPressed(.LEFT) {
-			if lightbox.open {
-				close_lightbox()
-			} else if !pointer_over_ui() {
-				mouse := rl.GetMousePosition()
-				pic := crawl_tile_at(mouse, view_top, view_len, sw, sh) if mode == .Crawl else tile_at(mouse, view_top)
-				if pic >= 0 do open_lightbox(pic)
-			}
-		}
+		hovered := handle_pointer(sw, sh)
 
 		rl.BeginDrawing()
 		rl.ClearBackground(BG)
-		if mode == .Crawl do draw_crawl_plane(view_top, view_len, sw, sh, now)
-		else do draw_grid(view_top, view_len, now)
+		draw_wall(view_top, view_len, hovered, now)
 		render_clay(&commands)
 		rl.EndDrawing()
 
-		if s := current_settings(); s != saved {
+		// Not mid-drag, which would write the file every frame.
+		adjusting := (drag.moved && angle_open) || active_slider != 0
+		if s := current_settings(); s != saved && !adjusting {
 			save_settings(s)
 			saved = s
 		}
@@ -514,9 +574,9 @@ parse_args :: proc() {
 		case "-s", "--shuffle":
 			opts.shuffle = true
 		case "-x", "--sideways":
-			mode = .Sideways
+			direction = .E
 		case "-c", "--crawl":
-			mode = .Crawl
+			tilt_x = CRAWL_TILT
 		case "-h", "--help":
 			fmt.println(USAGE)
 			os.exit(0)
@@ -559,6 +619,15 @@ load_settings :: proc() -> Settings {
 		return current_settings()
 	}
 
+	set_angle :: proc(dst: ^f64, s: string, lo, hi: f64) -> bool {
+		dst^ = clamp(strconv.parse_f64(s) or_return, lo, hi)
+		return true
+	}
+
+	// Older versions saved a mode (vertical, sideways or crawl) and which way
+	// crawl went; they're turned into a direction and tilt below.
+	old_mode, old_toward := "", false
+
 	text := string(data)
 	line_no := 0
 	for line in strings.split_lines_iterator(&text) {
@@ -574,34 +643,50 @@ load_settings :: proc() -> Settings {
 
 		ok := true
 		switch key {
-		case "mode":
+		case "direction":
 			ok = false
-			for name, m in MODE_NAMES {
-				if value == name do mode, ok = m, true
+			for name, d in DIRECTION_NAMES {
+				if value == name do direction, ok = d, true
 			}
+		case "tilt_x": ok = set_angle(&tilt_x, value, -MAX_TILT, MAX_TILT)
+		case "tilt_y": ok = set_angle(&tilt_y, value, -MAX_TILT, MAX_TILT)
+		case "spin":   ok = set_angle(&spin, value, -180, 180)
+		case "fov":    ok = set_angle(&fov, value, 15, 100)
+		case "mode":
+			ok = value == "vertical" || value == "sideways" || value == "crawl"
+			if ok do old_mode = value
+		case "crawl_toward": ok = set_bool(&old_toward, value)
 		case "speed":
 			if v, vok := strconv.parse_f64(value); vok do speed = clamp(v, 10, 2000)
 			else do ok = false
 		case "lanes":
 			if v, vok := strconv.parse_int(value, 10); vok do lanes_setting = clamp(v, 0, 12)
 			else do ok = false
-		case "crawl_toward": ok = set_bool(&crawl_toward, value)
-		case "ui_hidden":    ok = set_bool(&ui_hidden, value)
-		case "autoscroll":   ok = set_bool(&autoscroll, value)
-		case "fullscreen":   ok = set_bool(&fullscreen, value)
+		case "ui_hidden":  ok = set_bool(&ui_hidden, value)
+		case "autoscroll": ok = set_bool(&autoscroll, value)
+		case "fullscreen": ok = set_bool(&fullscreen, value)
 		case:
 			fmt.eprintfln("scrolld: %s:%d: unknown setting %s", settings_path, line_no, key)
 			continue
 		}
 		if !ok do fmt.eprintfln("scrolld: %s:%d: bad value for %s: %s", settings_path, line_no, key, value)
 	}
+
+	switch old_mode {
+	case "vertical": direction = .N
+	case "sideways": direction = .E
+	case "crawl":    direction, tilt_x = old_toward ? .S : .N, CRAWL_TILT
+	}
 	return current_settings()
 }
 
 current_settings :: proc() -> Settings {
 	return {
-		mode = mode,
-		crawl_toward = crawl_toward,
+		direction = direction,
+		tilt_x = tilt_x,
+		tilt_y = tilt_y,
+		spin = spin,
+		fov = fov,
 		speed = speed,
 		lanes = lanes_setting,
 		ui_hidden = ui_hidden,
@@ -617,9 +702,12 @@ save_settings :: proc(s: Settings) {
 	if settings_dir == "" do return
 	b := strings.builder_make(context.temp_allocator)
 	fmt.sbprintln(&b, "# scrolld settings, saved whenever they change in the app")
-	fmt.sbprintln(&b, "# mode: vertical, sideways or crawl; lanes: 0 = auto")
-	fmt.sbprintfln(&b, "mode = %s", MODE_NAMES[s.mode])
-	fmt.sbprintfln(&b, "crawl_toward = %v", s.crawl_toward)
+	fmt.sbprintln(&b, "# direction: n, ne, e, se, s, sw, w or nw; angles in degrees; lanes: 0 = auto")
+	fmt.sbprintfln(&b, "direction = %s", DIRECTION_NAMES[s.direction])
+	fmt.sbprintfln(&b, "tilt_x = %.1f", s.tilt_x)
+	fmt.sbprintfln(&b, "tilt_y = %.1f", s.tilt_y)
+	fmt.sbprintfln(&b, "spin = %.1f", s.spin)
+	fmt.sbprintfln(&b, "fov = %.1f", s.fov)
 	fmt.sbprintfln(&b, "speed = %v", s.speed)
 	fmt.sbprintfln(&b, "lanes = %d", s.lanes)
 	fmt.sbprintfln(&b, "ui_hidden = %v", s.ui_hidden)
@@ -711,30 +799,89 @@ heif_info :: proc(path: cstring, w, h: ^c.int) -> bool {
 
 // --- Layout ------------------------------------------------------------------
 
-lane_count :: proc(cross: f64) -> int {
+lane_count :: proc(cross: f64, as_rows := rows) -> int {
 	if lanes_setting > 0 do return lanes_setting
-	return max(1, int(cross / (sideways ? MIN_ROW_H : MIN_COL_W)))
+	return max(1, int(cross / (as_rows ? MIN_ROW_H : MIN_COL_W)))
 }
 
-// Where content starts along the scroll direction: below the bar when
-// vertical (tiles scroll under it), just the gap otherwise.
-content_lead :: proc() -> f64 {
-	if mode != .Vertical || ui_hidden do return GAP
-	return BAR_H + GAP
+diagonal :: proc() -> bool {
+	return int(direction) % 2 == 1
 }
 
-// Maps a placement from lane space to the screen.
-tile_rect :: proc(p: Placement, view_top: f64) -> rl.Rectangle {
-	if sideways do return {f32(p.y - view_top), f32(p.x), f32(p.h), f32(p.w)}
-	return {f32(p.x), f32(p.y - view_top), f32(p.w), f32(p.h)}
+// Which way lane -y points on screen, in degrees clockwise from up. The
+// diagonals keep upright columns, moving up or down, and drift them sideways.
+grid_bearing :: proc() -> int {
+	b := int(direction) * 45
+	if diagonal() do return b < 90 || b > 270 ? 0 : 180
+	return b
 }
 
-// Width to decode a thumbnail at: the lane size, or for rows, the width that
-// gives the row height.
+// How far the columns drift across, per unit of scroll along them: right on
+// screen for NE and SE, left for NW and SW (lane x points left when they
+// move down).
+drift :: proc() -> f64 {
+	if !diagonal() do return 0
+	right := direction == .NE || direction == .SE
+	return right == (grid_bearing() == 0) ? 1 : -1
+}
+
+// The flat screen's extent across and along the lanes.
+screen_extent :: proc(sw, sh: f64) -> (across, along: f64) {
+	if grid_bearing() % 180 == 0 do return sw, sh
+	return sh, sw
+}
+
+// Degrees to turn each image within its lane so it's upright on screen (before
+// spin).
+image_rotation :: proc() -> f32 {
+	return f32((360 - grid_bearing()) % 360)
+}
+
+// The lanes across the flat screen (count and size), and how many more each
+// side needs to reach the edges of the part of the wall on screen, in whole
+// blocks of n.
+lane_geometry :: proc(across: f64) -> (n: int, size: f64, side: int) {
+	n = lane_count(across)
+	size = max((across - GAP * f64(n + 1)) / f64(n), 1)
+	reach := max(-plane.lo.x, plane.hi.x) - across / 2
+	// Less a hair, so rounding error doesn't add lanes to a flat wall.
+	side = clamp(int(math.ceil(reach / (size + GAP) - 0.001)), 0, MAX_SIDE_LANES)
+	// Drifting lanes wrap around, which has to happen out of sight.
+	if diagonal() do side += 1
+	side = (side + n - 1) / n * n
+	return
+}
+
+// A placement's x in lane space, after drifting: the lanes wrap around, so a
+// lane leaving one side comes back in on the other.
+tile_x :: proc(p: Placement) -> f64 {
+	d := drift()
+	if d == 0 do return p.x
+	width := f64(len(heights)) * (lane_size + GAP)
+	rel := p.x - lane_origin + d * scroll
+	return lane_origin + rel - width * math.floor(rel / width)
+}
+
+// A placement's rectangle in lane space relative to scroll, where the plane
+// is drawn.
+tile_rect :: proc(p: Placement) -> rl.Rectangle {
+	return {f32(tile_x(p)), f32(p.y - scroll), f32(p.w), f32(p.h)}
+}
+
+// The image's size within a tile, which is turned a quarter turn for rows.
+image_size :: proc(dst: rl.Rectangle) -> (w, h: f32) {
+	return rows ? dst.height : dst.width, rows ? dst.width : dst.height
+}
+
+// Width to decode a thumbnail at: the column width, or the width that gives
+// the row height, whichever is bigger.
 thumb_width :: proc(pic: int) -> i32 {
-	if !sideways do return thumb_px
+	return max(thumb_px, row_thumb_width(pic))
+}
+
+row_thumb_width :: proc(pic: int) -> i32 {
 	p := pics[pic]
-	return max(i32(math.ceil(f64(thumb_px) * f64(p.width) / f64(p.height))), 1)
+	return max(i32(math.ceil(f64(thumb_row_px) * f64(p.width) / f64(p.height))), 1)
 }
 
 // Which picture the k-th tile shows. Wraps around forever; with --shuffle,
@@ -752,54 +899,82 @@ pic_for :: proc(k: int) -> int {
 	return perm[k % n]
 }
 
-extend_layout :: proc(until_y: f64, min_count := 0) {
+// The lanes come in blocks of `lanes`: block 0 is the screen's own, and
+// blocks ±1, ±2... are added out to the sides as the angle needs them. Each
+// block is laid out on its own, from its own run of pictures, so adding or
+// dropping blocks never moves the tiles in the others (and their textures
+// stay loaded). Placements still come out in y order: the next tile always
+// goes into the shortest lane overall, which is also the shortest in its block.
+extend_layout :: proc(until_y: f64, min_center := 0) {
+	side_blocks := side_lanes / lanes
 	for {
 		shortest := 0
 		for h, i in heights do if h < heights[shortest] do shortest = i
-		if len(placements) >= min_count && heights[shortest] >= until_y do return
+		if block_counts[side_blocks] >= min_center && heights[shortest] >= until_y do return
 
-		pic := pic_for(len(placements))
+		bi := shortest / lanes
+		block, k := bi - side_blocks, block_counts[bi]
+		block_counts[bi] += 1
+		pic := pic_for(k)
+		// Other blocks show the same run turned around by a different amount.
+		if block != 0 {
+			pic = (pic + (abs(block) * 2 - (block < 0 ? 1 : 0)) * 7919) % len(pics)
+		}
 		aspect := f64(pics[pic].height) / f64(pics[pic].width)
-		h := lane_size * (sideways ? 1 / aspect : aspect)
+		h := lane_size * (rows ? 1 / aspect : aspect)
 		x := lane_origin + GAP + f64(shortest) * (lane_size + GAP)
-		append(&placements, Placement{pic = pic, x = x, y = heights[shortest], w = lane_size, h = h})
+		append(&placements, Placement{pic = pic, block = block, k = k, x = x, y = heights[shortest], w = lane_size, h = h})
 		heights[shortest] += h + GAP
 		max_tile_h = max(max_tile_h, h)
 	}
 }
 
-// Rebuilds the layout for a new size, lane count or direction, keeping the
-// tile at the leading edge of the screen where it was.
-relayout :: proc(cross, origin: f64) {
+// Rebuilds the layout for a new lane geometry (from lane_geometry) or
+// direction, keeping the screen's tile at the leading edge of the view where
+// it was. When only the side blocks change, everything stays put.
+relayout :: proc(n: int, size: f64, side: int) {
 	anchor, anchor_dy := -1, 0.0
-	view_top := scroll - content_lead()
+	view_top := scroll + plane.lo.y
 	for i := first_index(view_top); i < len(placements); i += 1 {
-		if placements[i].y + placements[i].h > view_top {
-			anchor, anchor_dy = i, placements[i].y - scroll
+		p := placements[i]
+		if p.block == 0 && p.y + p.h > view_top {
+			anchor, anchor_dy = p.k, p.y - scroll
 			break
 		}
 	}
 
-	lanes = lane_count(cross)
-	lane_size = max((cross - GAP * f64(lanes + 1)) / f64(lanes), 1)
-	// The crawl plane widens past the screen so its far end still spans it.
-	side_lanes = mode == .Crawl ? int(math.ceil(crawl_overhang(cross) / (lane_size + GAP))) : 0
-	lane_origin = origin - f64(side_lanes) * (lane_size + GAP)
-	resize(&heights, lanes + 2 * side_lanes)
+	lanes, lane_size, side_lanes = n, size, side
+	total := lanes + 2 * side_lanes
+	lane_origin = -(f64(total) * (lane_size + GAP) + GAP) / 2
+	resize(&heights, total)
 	slice.fill(heights[:], 0)
+	resize(&block_counts, total / lanes)
+	slice.fill(block_counts[:], 0)
 	clear(&placements)
 	max_tile_h = 0
 	perm_pass = -1
 	if anchor >= 0 {
 		extend_layout(0, anchor + 1)
-		scroll = max(placements[anchor].y - anchor_dy, 0)
+		for p in placements {
+			if p.block == 0 && p.k == anchor {
+				scroll = max(p.y - anchor_dy, 0)
+				break
+			}
+		}
 	}
+}
 
-	// Thumbnails are decoded at lane size in physical pixels, rounded up so
-	// small resizes don't throw them all away.
-	px := i32(math.ceil(lane_size * f64(rl.GetWindowScaleDPI().x) / 128) * 128)
-	if px != thumb_px || sideways != thumb_sideways {
-		thumb_px, thumb_sideways = px, sideways
+// Thumbnails are decoded at lane size in physical pixels, rounded up so small
+// resizes don't throw them all away.
+update_thumb_sizes :: proc(sw, sh: f64) {
+	px :: proc(across: f64, as_rows: bool) -> i32 {
+		n := lane_count(across, as_rows)
+		size := max((across - GAP * f64(n + 1)) / f64(n), 1)
+		return i32(math.ceil(size * f64(rl.GetWindowScaleDPI().x) / 128) * 128)
+	}
+	col, row := px(sw, false), px(sh, true)
+	if col != thumb_px || row != thumb_row_px {
+		thumb_px, thumb_row_px = col, row
 		reset_textures()
 	}
 }
@@ -816,16 +991,15 @@ first_index :: proc(y: f64) -> int {
 	return lo
 }
 
-tile_at :: proc(mouse: rl.Vector2, view_top: f64) -> int {
-	if sideways do return tile_at_lane_point(f64(mouse.y), view_top + f64(mouse.x))
-	return tile_at_lane_point(f64(mouse.x), view_top + f64(mouse.y))
-}
-
-// The picture at a point in lane space (across, along), or -1.
-tile_at_lane_point :: proc(across, along: f64) -> int {
+// The placement under a point on screen, or -1.
+placement_at :: proc(mouse: rl.Vector2) -> int {
+	v, ok := screen_to_lane(mouse)
+	if !ok do return -1
+	across, along := v.x, v.y + scroll
 	for i := first_index(along); i < len(placements) && placements[i].y <= along; i += 1 {
 		p := placements[i]
-		if across >= p.x && across < p.x + p.w && along >= p.y && along < p.y + p.h do return p.pic
+		x := tile_x(p)
+		if across >= x && across < x + p.w && along >= p.y && along < p.y + p.h do return i
 	}
 	return -1
 }
@@ -931,13 +1105,12 @@ enqueue :: proc(job: Job, front := false) {
 }
 
 // Marks pictures between content y0 and y1 as in use, and optionally queues
-// the ones that aren't loaded yet. In crawl mode, only the ones inside the
-// part of the plane on screen, or that will scroll into it.
-mark_range :: proc(y0, y1: f64, request: bool, view_top, view_len, sw, sh: f64) {
+// the ones that aren't loaded yet. Only the ones in the part of the wall on
+// screen count, or that line up with it to scroll in.
+mark_range :: proc(y0, y1: f64, request: bool) {
 	for i := first_index(y0); i < len(placements) && placements[i].y < y1; i += 1 {
 		p := placements[i]
-		if p.y + p.h < y0 do continue
-		if mode == .Crawl && !crawl_in_view(p, view_top, view_len, sw, sh) do continue
+		if p.y + p.h < y0 || !in_view(p) do continue
 		t := &texs[p.pic]
 		t.used = frame
 		sync.atomic_store(&loader.wanted[p.pic], frame)
@@ -948,13 +1121,13 @@ mark_range :: proc(y0, y1: f64, request: bool, view_top, view_len, sw, sh: f64) 
 	}
 }
 
-update_textures :: proc(view_top, view_h, sw, sh: f64) {
+update_textures :: proc(view_top, view_h: f64) {
 	view_bottom := view_top + view_h
 	// Visible tiles first, then a band ahead of (and a bit behind) the viewport.
-	mark_range(view_top, view_bottom, true, view_top, view_h, sw, sh)
-	mark_range(view_top - view_h * 0.5, view_bottom + view_h * 1.5, true, view_top, view_h, sw, sh)
+	mark_range(view_top, view_bottom, true)
+	mark_range(view_top - view_h * 0.5, view_bottom + view_h * 1.5, true)
 	// Textures stay loaded within a wider band so they don't thrash at the edges.
-	mark_range(view_top - view_h * 2, view_bottom + view_h * 3, false, view_top, view_h, sw, sh)
+	mark_range(view_top - view_h * 2, view_bottom + view_h * 3, false)
 	if lightbox.open do texs[lightbox.pic].used = frame
 }
 
@@ -987,7 +1160,7 @@ process_results :: proc(now: f64) {
 			t.state = .Failed
 		case .Ok:
 			t.tex = rl.LoadTextureFromImage(r.image)
-			set_tile_filter(&t.tex)
+			set_tile_filter(r.job.pic)
 			t.state = .Ready
 			t.ready_at = now
 			append(&loaded, r.job.pic)
@@ -995,10 +1168,13 @@ process_results :: proc(now: f64) {
 	}
 }
 
-// Crawl minifies the far tiles heavily; mipmaps and anisotropic filtering
-// keep them from shimmering as they move.
-set_tile_filter :: proc(tex: ^rl.Texture2D) {
-	if mode != .Crawl {
+// A tilted wall minifies the far tiles heavily, and a thumbnail decoded for
+// the other kind of lane can be well over the size it's drawn at; mipmaps and
+// anisotropic filtering keep them from shimmering as they move.
+set_tile_filter :: proc(pic: int) {
+	tex := &texs[pic].tex
+	drawn := rows ? row_thumb_width(pic) : thumb_px
+	if !tilted() && f64(tex.width) < f64(drawn) * 1.5 {
 		rl.SetTextureFilter(tex^, .BILINEAR)
 		return
 	}
@@ -1007,10 +1183,12 @@ set_tile_filter :: proc(tex: ^rl.Texture2D) {
 	rl.SetTextureFilter(tex^, .ANISOTROPIC_16X)
 }
 
+// Unloads textures that have been out of range for a while, so turning the
+// wall back and forth doesn't keep reloading the same ones.
 evict :: proc() {
 	for i := 0; i < len(loaded); {
 		t := &texs[loaded[i]]
-		if t.used < frame {
+		if t.used + EVICT_AFTER_FRAMES < frame {
 			rl.UnloadTexture(t.tex)
 			t^ = {}
 			unordered_remove(&loaded, i)
@@ -1050,7 +1228,7 @@ close_lightbox :: proc() {
 
 // --- Input -------------------------------------------------------------------
 
-handle_keys :: proc(view_len: f64) {
+handle_keys :: proc(screen_len: f64) {
 	pressed :: proc(keys: ..rl.KeyboardKey) -> bool {
 		for k in keys do if rl.IsKeyPressed(k) || rl.IsKeyPressedRepeat(k) do return true
 		return false
@@ -1074,16 +1252,67 @@ handle_keys :: proc(view_len: f64) {
 	// the key-up, so raylib would think F is still held and miss the next press.
 	if rl.IsKeyReleased(.F) do set_fullscreen(!fullscreen)
 	if rl.IsKeyPressed(.H) do ui_hidden = !ui_hidden
-	if rl.IsKeyPressed(.D) do mode = Mode((int(mode) + 1) % len(Mode))
-	if rl.IsKeyPressed(.R) do crawl_toward = !crawl_toward
+	if rl.IsKeyPressed(.D) do direction = Direction((int(direction) + 1) % len(Direction))
+	if rl.IsKeyPressed(.A) do angle_open = !angle_open
+	if rl.IsKeyPressed(.R) do set_angle(0, 0, 0)
 
-	// Forward is down, or right when sideways; both arrow pairs work in either mode.
+	// Down and right go forward whatever the direction.
 	if !lightbox.open {
 		if pressed(.DOWN, .RIGHT) do scroll += 100
 		if pressed(.UP, .LEFT) do scroll -= 100
-		if pressed(.PAGE_DOWN) do scroll += view_len * 0.9
-		if pressed(.PAGE_UP) do scroll -= view_len * 0.9
+		if pressed(.PAGE_DOWN) do scroll += screen_len * 0.9
+		if pressed(.PAGE_UP) do scroll -= screen_len * 0.9
 	}
+}
+
+set_angle :: proc(x, y: f64, field_of_view := DEFAULT_FOV) {
+	tilt_x, tilt_y, spin, fov = x, y, 0, field_of_view
+}
+
+// A press on the wall opens the picture under it if it's released without
+// moving; dragging rotates the wall while the angle panel is open. Returns the
+// hovered placement, or -1.
+handle_pointer :: proc(sw, sh: f64) -> int {
+	mouse := rl.GetMousePosition()
+	if rl.IsMouseButtonPressed(.LEFT) {
+		if lightbox.open do close_lightbox()
+		else if !pointer_over_ui() do drag = {down = true, start = mouse, last = mouse}
+	}
+	if drag.down {
+		if rl.IsMouseButtonDown(.LEFT) {
+			if rl.Vector2Distance(mouse, drag.start) > 4 do drag.moved = true
+			if drag.moved && angle_open && !ui_hidden do rotate_by_drag(drag.last, mouse, sw, sh)
+			drag.last = mouse
+		} else {
+			if !drag.moved {
+				if i := placement_at(mouse); i >= 0 do open_lightbox(placements[i].pic)
+			}
+			drag = {}
+		}
+	}
+
+	if lightbox.open || drag.moved || pointer_over_ui() do return -1
+	return placement_at(mouse)
+}
+
+// Like GIMP's 3D transform: the wall turns as if grabbed and pulled. Shift
+// keeps to the axis dragged along most, Ctrl (Cmd on macOS) spins it instead.
+rotate_by_drag :: proc(prev, cur: rl.Vector2, sw, sh: f64) {
+	if rl.IsKeyDown(.LEFT_CONTROL) || rl.IsKeyDown(.RIGHT_CONTROL) || rl.IsKeyDown(.LEFT_SUPER) || rl.IsKeyDown(.RIGHT_SUPER) {
+		center := rl.Vector2{f32(sw / 2), f32(sh / 2)}
+		a0 := math.atan2(f64(prev.y - center.y), f64(prev.x - center.x))
+		a1 := math.atan2(f64(cur.y - center.y), f64(cur.x - center.x))
+		spin = math.mod(spin + math.to_degrees(a1 - a0) + 540, 360) - 180
+		return
+	}
+	d := cur - prev
+	if rl.IsKeyDown(.LEFT_SHIFT) || rl.IsKeyDown(.RIGHT_SHIFT) {
+		total := cur - drag.start
+		if abs(total.x) > abs(total.y) do d.y = 0
+		else do d.x = 0
+	}
+	tilt_x = clamp(tilt_x - f64(d.y) * DRAG_DEGREES_PER_PX, -MAX_TILT, MAX_TILT)
+	tilt_y = clamp(tilt_y + f64(d.x) * DRAG_DEGREES_PER_PX, -MAX_TILT, MAX_TILT)
 }
 
 change_speed :: proc(delta: f64) {
@@ -1096,46 +1325,64 @@ change_lanes :: proc(delta: int) {
 
 // --- Drawing -----------------------------------------------------------------
 
-// `crawl` draws onto the crawl plane: no hover, the far end fades out, and with
-// `crawl_toward` each image is flipped, because the grid is mapped onto the
-// plane upside down.
-draw_grid :: proc(view_top, view_len: f64, now: f64, crawl := false) {
-	mouse := rl.GetMousePosition()
+// Draws the grid onto the plane.
+draw_wall :: proc(view_top, view_len: f64, hovered: int, now: f64) {
+	rl.BeginMode3D(plane.cam)
+	// Everything is coplanar and drawn in order, as in 2D.
+	rlgl.DisableDepthTest()
+	rlgl.DisableBackfaceCulling()
+	a, b, n := plane.a, plane.b, plane.n
+	m := [16]f32 {
+		f32(a.x), f32(a.y), f32(a.z), 0,
+		f32(b.x), f32(b.y), f32(b.z), 0,
+		f32(n.x), f32(n.y), f32(n.z), 0,
+		0, 0, 0, 1,
+	}
+	rlgl.PushMatrix()
+	rlgl.MultMatrixf(&m[0])
+	draw_grid(view_top, view_len, hovered, now)
+	rlgl.PopMatrix()
+	rlgl.EnableBackfaceCulling()
+	rl.EndMode3D()
+}
+
+// Draws in lane space relative to scroll (draw_wall puts that on the plane),
+// skipping tiles outside the part of the wall on screen.
+draw_grid :: proc(view_top, view_len: f64, hovered: int, now: f64) {
 	dpi := rl.GetWindowScaleDPI().x
-	flip := crawl && crawl_toward
+	rot := image_rotation()
 	first := first_index(view_top)
 	view_bottom := view_top + view_len
-	fade := crawl ? crawl_fade_depth(view_len) : 0
+	fade := f32(plane.fade_depth)
 	rl.SetShaderValue(fade_shader, fade_loc, &fade, .FLOAT)
 	rl.SetShaderValue(tile_shader, tile_locs.fade, &fade, .FLOAT)
 
-	// Placeholders (and hover detection) first...
+	// Placeholders first...
 	rl.BeginShaderMode(fade_shader)
-	hovered := -1
 	for i := first; i < len(placements) && placements[i].y < view_bottom; i += 1 {
 		p := placements[i]
-		if p.y + p.h < view_top do continue
-		dst := tile_rect(p, view_top)
+		if p.y + p.h < view_top || !in_view(p) do continue
+		dst := tile_rect(p)
 		// Skip it under fully faded-in images, where it would fringe the antialiased edge.
 		t := &texs[p.pic]
 		if t.state != .Ready || now - t.ready_at < FADE_IN_SECS {
 			rl.DrawRectangleRounded(dst, TILE_RADIUS * 2 / min(dst.width, dst.height), 6, TILE_BG)
 		}
-		if !lightbox.open && rl.CheckCollisionPointRec(mouse, dst) do hovered = i
 	}
 	rl.EndShaderMode()
-	if crawl || (!ui_hidden && f64(mouse.y) <= BAR_H) || pointer_over_ui() do hovered = -1
 
-	// ...then the loaded images through the rounding shader.
+	// ...then the loaded images through the rounding shader, each turned about
+	// its center to stand upright.
 	rl.BeginShaderMode(tile_shader)
 	radius := TILE_RADIUS * dpi
 	rl.SetShaderValue(tile_shader, tile_locs.radius, &radius, .FLOAT)
 	for i := first; i < len(placements) && placements[i].y < view_bottom; i += 1 {
 		p := placements[i]
 		t := &texs[p.pic]
-		if p.y + p.h < view_top || t.state != .Ready do continue
-		dst := tile_rect(p, view_top)
-		size := [2]f32{dst.width * dpi, dst.height * dpi}
+		if p.y + p.h < view_top || t.state != .Ready || !in_view(p) do continue
+		dst := tile_rect(p)
+		w, h := image_size(dst)
+		size := [2]f32{w * dpi, h * dpi}
 		caption := i == hovered ? CAPTION_H * dpi : 0
 		// Uniforms apply to the whole pending batch, so flush before changing them.
 		rlgl.DrawRenderBatchActive()
@@ -1143,110 +1390,167 @@ draw_grid :: proc(view_top, view_len: f64, now: f64, crawl := false) {
 		rl.SetShaderValue(tile_shader, tile_locs.caption, &caption, .FLOAT)
 		alpha := f32(clamp((now - t.ready_at) / FADE_IN_SECS, 0, 1))
 		src := rl.Rectangle{0, 0, f32(t.tex.width), f32(t.tex.height)}
-		if flip do src.height = -src.height
-		rl.DrawTexturePro(t.tex, src, dst, {}, 0, rl.Fade(rl.WHITE, alpha))
+		centered := rl.Rectangle{dst.x + dst.width / 2, dst.y + dst.height / 2, w, h}
+		rl.DrawTexturePro(t.tex, src, centered, {w / 2, h / 2}, rot, rl.Fade(rl.WHITE, alpha))
 	}
 	rl.EndShaderMode()
 
-	// File name on hover.
+	// File name on hover, along the bottom of the image.
 	if hovered >= 0 {
-		dst := tile_rect(placements[hovered], view_top)
-		y := dst.y + dst.height - CAPTION_H
-		name := strings.clone_to_cstring(pics[placements[hovered].pic].name, context.temp_allocator)
-		rl.BeginScissorMode(i32(dst.x), i32(y), i32(dst.width), i32(CAPTION_H))
-		rl.DrawTextEx(ui_font, name, {dst.x + 10, y + 14}, 16, 0, rl.RAYWHITE)
-		rl.EndScissorMode()
+		dst := tile_rect(placements[hovered])
+		w, h := image_size(dst)
+		name := fit_text(pics[placements[hovered].pic].name, 16, w - 20)
+		rlgl.PushMatrix()
+		rlgl.Translatef(dst.x + dst.width / 2, dst.y + dst.height / 2, 0)
+		rlgl.Rotatef(rot, 0, 0, 1)
+		rl.DrawTextEx(ui_font, name, {-w / 2 + 10, h / 2 - CAPTION_H + 14}, 16, 0, rl.RAYWHITE)
+		rlgl.PopMatrix()
 	}
 }
 
-// --- Crawl -------------------------------------------------------------------
+// The text, cut short with "..." if needed to fit max_w at the font size.
+fit_text :: proc(text: string, size, max_w: f32) -> cstring {
+	s := text
+	for {
+		cut := len(s) < len(text) ? strings.concatenate({s, "..."}, context.temp_allocator) : s
+		c := strings.clone_to_cstring(cut, context.temp_allocator)
+		if len(s) == 0 || rl.MeasureTextEx(ui_font, c, size, 0).x <= max_w do return c
+		_, n := utf8.decode_last_rune_in_string(s)
+		s = s[:len(s) - n]
+	}
+}
+
+// --- Plane -------------------------------------------------------------------
 //
-// The column grid is drawn straight onto a plane tilted back from the bottom
-// edge of the screen. Away: the grid's bottom (newest content) is the near
-// edge, so tiles appear at the bottom and recede. Toward: its top is the near
-// edge instead, so tiles come out of the distance. The plane is wider than
-// the screen, by the same number of lanes on each side, so that it still fills
-// the screen's width at the far end.
+// Lane space is mapped onto a plane through the middle of the screen: turned
+// within the plane so the content moves in `direction` (lane -y points that
+// way), spun, then tilted. The camera sits where the plane exactly fills the
+// screen when flat, so a flat wall is drawn 1:1. The wall fades out PLANE_FAR
+// behind the screen, which bounds how much of a tilted one is on screen.
 
-crawl_length :: proc(sh: f64) -> f64 {
-	return sh * CRAWL_SCREENS
+tilted :: proc() -> bool {
+	return tilt_x != 0 || tilt_y != 0
 }
 
-// Half the screen's width at distance s along the plane, in logical pixels.
-crawl_half_width :: proc(s, sw, sh: f64) -> f64 {
-	tilt := math.to_radians(f64(CRAWL_TILT))
-	return sw / 2 * (1 + 2 * s * math.sin(tilt) * math.tan(math.to_radians(f64(CRAWL_FOVY) / 2)) / sh)
+update_plane :: proc(sw, sh: f64) {
+	// Spin clockwise, lean the top away, then turn the right side away.
+	rotate :: proc(v: [3]f64) -> [3]f64 {
+		r := math.to_radians(-spin)
+		v := [3]f64{v.x * math.cos(r) - v.y * math.sin(r), v.x * math.sin(r) + v.y * math.cos(r), v.z}
+		r = math.to_radians(-tilt_x)
+		v = {v.x, v.y * math.cos(r) - v.z * math.sin(r), v.y * math.sin(r) + v.z * math.cos(r)}
+		r = math.to_radians(tilt_y)
+		return {v.x * math.cos(r) + v.z * math.sin(r), v.y, -v.x * math.sin(r) + v.z * math.cos(r)}
+	}
+
+	U :: PLANE_UNIT
+	b := math.to_radians(f64(grid_bearing()))
+	s, c := math.sin(b), math.cos(b)
+	// World y is up, lane (and screen) y is down.
+	plane.a = rotate({U * c, -U * s, 0})
+	plane.b = rotate({-U * s, -U * c, 0})
+	plane.n = rotate({0, 0, U})
+
+	half := math.tan(math.to_radians(fov) / 2)
+	dist := sh / 2 / half * U
+	plane.cam = {position = {0, 0, f32(dist)}, up = {0, 1, 0}, fovy = f32(fov), projection = .PERSPECTIVE}
+	plane.fade_depth = PLANE_FAR * sh * U
+
+	// A square of the plane bigger than any part of it that can be on screen,
+	// clipped to the view frustum and the fade-out depth.
+	big := 10 * (dist + plane.fade_depth) * (1 + sw / sh) / U
+	poly: [16][3]f64
+	poly[0] = (plane.a + plane.b) * big
+	poly[1] = (-plane.a + plane.b) * big
+	poly[2] = (-plane.a - plane.b) * big
+	poly[3] = (plane.a - plane.b) * big
+	n := 4
+	hx, hy := half * sw / sh, half
+	// Each keeps k.xyz · p + k.w >= 0.
+	keep := [5][4]f64 {
+		{1, 0, -hx, dist * hx},
+		{-1, 0, -hx, dist * hx},
+		{0, 1, -hy, dist * hy},
+		{0, -1, -hy, dist * hy},
+		{0, 0, 1, plane.fade_depth},
+	}
+	for k in keep do n = clip_polygon(&poly, n, k)
+
+	// Back into lane space, with the edge normals and the polygon's extent
+	// along each, for in_view.
+	plane.poly_n = n
+	plane.lo, plane.hi = {max(f64), max(f64)}, {min(f64), min(f64)}
+	for i in 0 ..< n {
+		v := [2]f64{linalg.dot(poly[i], plane.a), linalg.dot(poly[i], plane.b)} / (U * U)
+		plane.poly[i] = v
+		plane.lo, plane.hi = linalg.min(plane.lo, v), linalg.max(plane.hi, v)
+	}
+	for i in 0 ..< n {
+		e := plane.poly[(i + 1) % n] - plane.poly[i]
+		axis := [2]f64{-e.y, e.x}
+		plane.axes[i] = axis
+		plane.spans[i] = {max(f64), min(f64)}
+		for v in plane.poly[:n] {
+			d := linalg.dot(axis, v)
+			plane.spans[i] = {min(plane.spans[i][0], d), max(plane.spans[i][1], d)}
+		}
+	}
 }
 
-// How far the plane reaches past each side of the screen.
-crawl_overhang :: proc(sw: f64) -> f64 {
-	return crawl_half_width(CRAWL_SCREENS, sw, 1) - sw / 2
+// Sutherland–Hodgman: keeps the part of a convex polygon where k.xyz · p + k.w >= 0.
+clip_polygon :: proc(poly: ^[16][3]f64, n: int, k: [4]f64) -> int {
+	side :: proc(p: [3]f64, k: [4]f64) -> f64 {return k.x * p.x + k.y * p.y + k.z * p.z + k.w}
+	out: [16][3]f64
+	m := 0
+	for i in 0 ..< n {
+		p, q := poly[i], poly[(i + 1) % n]
+		fp, fq := side(p, k), side(q, k)
+		if fp >= 0 {
+			out[m] = p
+			m += 1
+		}
+		if (fp >= 0) != (fq >= 0) {
+			out[m] = p + (q - p) * (fp / (fp - fq))
+			m += 1
+		}
+	}
+	poly^ = out
+	return m
 }
 
-// Whether a tile is inside the part of the plane on screen, or will scroll
-// into it, judged at its far end (the screen widens with distance).
-crawl_in_view :: proc(p: Placement, view_top, view_len, sw, sh: f64) -> bool {
-	s := crawl_toward ? p.y + p.h - view_top : view_top + view_len - p.y
-	hw := crawl_half_width(clamp(s, 0, view_len), sw, sh)
-	return p.x < sw / 2 + hw && p.x + p.w > sw / 2 - hw
+// Whether a tile, with a gap's margin, overlaps the part of the wall on
+// screen. Tiles ahead of or behind it count if they line up with its nearest
+// edge, since that's where they'll scroll in.
+in_view :: proc(p: Placement) -> bool {
+	// Drifting tiles get a lane's margin, so they're loaded before they drift in.
+	margin := drift() != 0 ? lane_size + GAP : GAP
+	x := tile_x(p)
+	x0, x1 := x - margin, x + p.w + margin
+	y0 := clamp(p.y - scroll - GAP, plane.lo.y, plane.hi.y)
+	y1 := clamp(p.y - scroll + p.h + GAP, plane.lo.y, plane.hi.y)
+	if x1 < plane.lo.x || x0 > plane.hi.x do return false
+	// Separating axes: the box's own are covered by the bounds (and the
+	// clamp), leaving the polygon's edge normals.
+	for i in 0 ..< plane.poly_n {
+		axis, span := plane.axes[i], plane.spans[i]
+		lo := min(axis.x * x0, axis.x * x1) + min(axis.y * y0, axis.y * y1)
+		hi := max(axis.x * x0, axis.x * x1) + max(axis.y * y0, axis.y * y1)
+		if hi < span[0] || lo > span[1] do return false
+	}
+	return true
 }
 
-// Looking straight ahead, at the distance where the z=0 plane exactly fills
-// the screen, so the plane's near edge spans the full width.
-crawl_camera :: proc(sh: f64) -> rl.Camera3D {
-	d := sh / 2 / math.tan(math.to_radians(f64(CRAWL_FOVY) / 2)) * CRAWL_UNIT
-	return {position = {0, 0, f32(d)}, up = {0, 1, 0}, fovy = CRAWL_FOVY, projection = .PERSPECTIVE}
-}
-
-// Near-left, near-right, far-right, far-left: the part of the plane that can
-// be on screen.
-crawl_corners :: proc(view_len, sw, sh: f64) -> [4]rl.Vector3 {
-	tilt := math.to_radians(f64(CRAWL_TILT))
-	x := f32(crawl_half_width(view_len, sw, sh) * CRAWL_UNIT)
-	y := f32(-sh / 2 * CRAWL_UNIT)
-	l := view_len * CRAWL_UNIT
-	fy, fz := y + f32(l * math.cos(tilt)), f32(-l * math.sin(tilt))
-	return {{-x, y, 0}, {x, y, 0}, {x, fy, fz}, {-x, fy, fz}}
-}
-
-// World depth of the plane's far end, where it has faded out.
-crawl_fade_depth :: proc(view_len: f64) -> f32 {
-	return f32(view_len * math.sin(math.to_radians(f64(CRAWL_TILT))) * CRAWL_UNIT)
-}
-
-draw_crawl_plane :: proc(view_top, view_len, sw, sh: f64, now: f64) {
-	rl.BeginMode3D(crawl_camera(sh))
-	// Everything is coplanar and drawn in order, as in 2D.
-	rlgl.DisableDepthTest()
-	rlgl.DisableBackfaceCulling()
-
-	// Maps the grid's logical pixels onto the plane: across stays x (centered
-	// on the screen), and y becomes the distance from the near edge.
-	along, sign: f32 = f32(view_len), -1
-	if crawl_toward do along, sign = 0, 1
-	rlgl.PushMatrix()
-	rlgl.Translatef(0, f32(-sh / 2 * CRAWL_UNIT), 0)
-	rlgl.Rotatef(-CRAWL_TILT, 1, 0, 0)
-	rlgl.Scalef(CRAWL_UNIT, CRAWL_UNIT, CRAWL_UNIT)
-	rlgl.Translatef(f32(-sw / 2), along, 0)
-	rlgl.Scalef(1, sign, 1)
-	draw_grid(view_top, view_len, now, crawl = true)
-	rlgl.PopMatrix()
-
-	rlgl.EnableBackfaceCulling()
-	rl.EndMode3D()
-}
-
-// Casts the mouse onto the plane and maps the hit back into lane space.
-crawl_tile_at :: proc(mouse: rl.Vector2, view_top, view_len, sw, sh: f64) -> int {
-	c := crawl_corners(view_len, sw, sh)
-	hit := rl.GetRayCollisionQuad(rl.GetScreenToWorldRay(mouse, crawl_camera(sh)), c[0], c[1], c[2], c[3])
-	if !hit.hit do return -1
-	// Distance from the near edge along the plane, in logical pixels.
-	s := f64(hit.point.y - c[0].y) / math.cos(math.to_radians(f64(CRAWL_TILT))) / CRAWL_UNIT
-	across := f64(hit.point.x) / CRAWL_UNIT + sw / 2
-	along := view_top + (crawl_toward ? s : view_len - s)
-	return tile_at_lane_point(across, along)
+// Where a point on screen lands on the wall, in lane space relative to scroll.
+screen_to_lane :: proc(pos: rl.Vector2) -> (v: [2]f64, ok: bool) {
+	ray := rl.GetScreenToWorldRay(pos, plane.cam)
+	o := [3]f64{f64(ray.position.x), f64(ray.position.y), f64(ray.position.z)}
+	d := [3]f64{f64(ray.direction.x), f64(ray.direction.y), f64(ray.direction.z)}
+	denom := linalg.dot(d, plane.n)
+	if abs(denom) < 1e-12 do return
+	t := -linalg.dot(o, plane.n) / denom
+	w := o + d * t
+	if t <= 0 || w.z < -plane.fade_depth do return
+	return [2]f64{linalg.dot(w, plane.a), linalg.dot(w, plane.b)} / (PLANE_UNIT * PLANE_UNIT), true
 }
 
 // --- Clay UI -----------------------------------------------------------------
@@ -1276,16 +1580,11 @@ build_ui :: proc(sw, sh: f64) -> clay.ClayArray(clay.RenderCommand) {
 			label(fmt.tprintf("%d", int(speed)), 16, TEXT)
 			if button("faster", "+") do change_speed(SPEED_STEP)
 
-			label("  ", 15, MUTED)
-			if button("vertical", "Vertical", mode == .Vertical) do mode = .Vertical
-			if button("sideways", "Sideways", mode == .Sideways) do mode = .Sideways
-			if button("crawl", "Crawl", mode == .Crawl) do mode = .Crawl
-			// Labelled with the direction it switches to.
-			if mode == .Crawl {
-				if button("toward", crawl_toward ? "Away" : "Toward") do crawl_toward = !crawl_toward
-			}
+			label("   Direction", 15, MUTED)
+			compass()
+			if button("angle", "Angle", angle_open) do angle_open = !angle_open
 
-			label(sideways ? "   Rows" : "   Columns", 15, MUTED)
+			label(rows ? "   Rows" : "   Columns", 15, MUTED)
 			if button("fewer", "-") do change_lanes(-1)
 			label(lanes_setting == 0 ? fmt.tprintf("Auto (%d)", lanes) : fmt.tprintf("%d", lanes), 16, TEXT)
 			if button("more", "+") do change_lanes(1)
@@ -1296,6 +1595,7 @@ build_ui :: proc(sw, sh: f64) -> clay.ClayArray(clay.RenderCommand) {
 			if clay.UI()({layout = {sizing = {width = clay.SizingFixed(6)}}}) {}
 			if menu_button(.Close) do ui_hidden = true
 		}
+		if angle_open do angle_panel()
 	} else if ui_hidden && !lightbox.open {
 		// Only the menu button, floating where it sits in the bar.
 		floating := clay.FloatingElementConfig {
@@ -1355,12 +1655,107 @@ button :: proc(id: string, text: string, active := false) -> (clicked: bool) {
 	return
 }
 
-Icon :: enum uintptr {
-	Menu = 1,
+// Panel under the top bar for the wall's angle, like the Rotate and Camera
+// tabs of GIMP's 3D transform tool.
+angle_panel :: proc() {
+	row :: proc(id, name: string, value: ^f64, lo, hi: f64) {
+		if clay.UI()({layout = {childGap = 12, childAlignment = {y = .Center}}}) {
+			if clay.UI()({layout = {sizing = {width = clay.SizingFixed(90)}}}) {
+				label(name, 15, MUTED)
+			}
+			slider(id, value, lo, hi)
+			if clay.UI()({layout = {sizing = {width = clay.SizingFixed(36)}, childAlignment = {x = .Right}}}) {
+				label(fmt.tprintf("%d", int(math.round(value^))), 15, TEXT)
+			}
+		}
+	}
+
+	if clay.UI()({
+		id = clay.ID("anglepanel"),
+		floating = {attachTo = .Root, attachment = {element = .RightTop, parent = .RightTop}, offset = {-16, BAR_H + 8}, zIndex = 5},
+		layout = {layoutDirection = .TopToBottom, padding = {16, 16, 14, 14}, childGap = 10},
+		backgroundColor = PANEL,
+		cornerRadius = clay.CornerRadiusAll(10),
+	}) {
+		row("tiltx", "Tilt back", &tilt_x, -MAX_TILT, MAX_TILT)
+		row("tilty", "Turn", &tilt_y, -MAX_TILT, MAX_TILT)
+		row("spin", "Spin", &spin, -180, 180)
+		row("fov", "Perspective", &fov, 15, 100)
+		if clay.UI()({layout = {childGap = 8, childAlignment = {y = .Center}}}) {
+			if button("flat", "Flat") do set_angle(0, 0)
+			if button("crawl", "Crawl") do set_angle(CRAWL_TILT, 0)
+		}
+		label("Drag the wall to rotate it.", 13, MUTED)
+		label("Shift: one axis.  Ctrl or Cmd: spin.", 13, MUTED)
+	}
+}
+
+// Drags (or jumps, when clicked) to the pointer's position along the track,
+// even once the pointer leaves it.
+slider :: proc(id: string, value: ^f64, lo, hi: f64) {
+	cid := clay.ID(id)
+	if clay.UI()({
+		id = cid,
+		layout = {sizing = {clay.SizingFixed(170), clay.SizingFixed(18)}},
+		custom = {customData = new_clone(Custom(Slider_Fill((value^ - lo) / (hi - lo))), context.temp_allocator)},
+	}) {
+		if clay.Hovered() && rl.IsMouseButtonPressed(.LEFT) do active_slider = cid.id
+	}
+	if active_slider != cid.id do return
+	if !rl.IsMouseButtonDown(.LEFT) {
+		active_slider = 0
+		return
+	}
+	b := clay.GetElementData(cid).boundingBox
+	frac := clamp((f64(rl.GetMouseX()) - f64(b.x)) / f64(b.width), 0, 1)
+	value^ = lo + frac * (hi - lo)
+}
+
+// A 3x3 grid of arrows, one for each direction around an empty middle.
+compass :: proc() {
+	COMPASS :: [3][3]Maybe(Direction){{.NW, .N, .NE}, {.W, nil, .E}, {.SW, .S, .SE}}
+	if clay.UI()({layout = {layoutDirection = .TopToBottom, childGap = 2}}) {
+		for line in COMPASS {
+			if clay.UI()({layout = {childGap = 2}}) {
+				for cell in line {
+					d, ok := cell.?
+					if !ok {
+						if clay.UI()({layout = {sizing = {clay.SizingFixed(20), clay.SizingFixed(14)}}}) {}
+						continue
+					}
+					if clay.UI()({
+						id = clay.ID("dir", u32(d)),
+						layout = {sizing = {clay.SizingFixed(20), clay.SizingFixed(14)}, childAlignment = {.Center, .Center}},
+						backgroundColor = d == direction ? ACCENT : clay.Hovered() ? BUTTON_HOVER : BUTTON,
+						cornerRadius = clay.CornerRadiusAll(3),
+					}) {
+						if clay.UI()({
+							layout = {sizing = {clay.SizingFixed(10), clay.SizingFixed(10)}},
+							custom = {customData = new_clone(Custom(d), context.temp_allocator)},
+						}) {}
+						if clay.Hovered() && rl.IsMouseButtonPressed(.LEFT) do direction = d
+					}
+				}
+			}
+		}
+	}
+}
+
+Icon :: enum {
+	Menu,
 	Close,
 }
 
-// The icon is a Clay custom element (Clay can't draw diagonals); render_clay draws it.
+Slider_Fill :: distinct f64 // 0 to 1
+
+// What render_clay draws for a Clay custom element (Clay can't draw diagonals
+// or circles): an icon, a direction's arrow, or a slider.
+Custom :: union {
+	Icon,
+	Direction,
+	Slider_Fill,
+}
+
 menu_button :: proc(icon: Icon, floating: clay.FloatingElementConfig = {}) -> (clicked: bool) {
 	if clay.UI()({
 		id = clay.ID("menu"),
@@ -1371,11 +1766,33 @@ menu_button :: proc(icon: Icon, floating: clay.FloatingElementConfig = {}) -> (c
 	}) {
 		if clay.UI()({
 			layout = {sizing = {clay.SizingFixed(16), clay.SizingFixed(14)}},
-			custom = {customData = rawptr(uintptr(icon))},
+			custom = {customData = new_clone(Custom(icon), context.temp_allocator)},
 		}) {}
 		clicked = clay.Hovered() && rl.IsMouseButtonPressed(.LEFT)
 	}
 	return
+}
+
+draw_custom :: proc(custom: Custom, b: clay.BoundingBox, color: rl.Color) {
+	switch v in custom {
+	case Icon:
+		draw_icon(v, b, color)
+	case Direction:
+		// A shaft through the middle, and a head at the end it points to.
+		r := math.to_radians(f32(v) * 45)
+		u := rl.Vector2{math.sin(r), -math.cos(r)} * min(b.width, b.height) / 2
+		c := rl.Vector2{b.x + b.width / 2, b.y + b.height / 2}
+		tip := c + u
+		rl.DrawLineEx(c - u, tip, 1.5, color)
+		rl.DrawLineEx(tip, tip - rl.Vector2Rotate(u, 0.6) * 0.7, 1.5, color)
+		rl.DrawLineEx(tip, tip - rl.Vector2Rotate(u, -0.6) * 0.7, 1.5, color)
+	case Slider_Fill:
+		x := b.x + b.width * f32(v)
+		y := b.y + b.height / 2
+		rl.DrawRectangleRounded({b.x, y - 2, b.width, 4}, 1, 4, {56, 56, 68, 255})
+		rl.DrawRectangleRounded({b.x, y - 2, x - b.x, 4}, 1, 4, {79, 140, 255, 255})
+		rl.DrawCircleV({x, y}, 7, color)
+	}
 }
 
 draw_icon :: proc(icon: Icon, b: clay.BoundingBox, color: rl.Color) {
@@ -1395,6 +1812,7 @@ draw_icon :: proc(icon: Icon, b: clay.BoundingBox, color: rl.Color) {
 }
 
 pointer_over_ui :: proc() -> bool {
+	if angle_open && clay.PointerOver(clay.ID("anglepanel")) do return true
 	return clay.PointerOver(clay.ID("topbar")) || clay.PointerOver(clay.ID("menu"))
 }
 
@@ -1421,7 +1839,7 @@ render_clay :: proc(commands: ^clay.ClayArray(clay.RenderCommand)) {
 			tex := (^rl.Texture2D)(cmd.renderData.image.imageData)^
 			rl.DrawTexturePro(tex, {0, 0, f32(tex.width), f32(tex.height)}, rect, {}, 0, rl.WHITE)
 		case .Custom:
-			draw_icon(Icon(uintptr(cmd.renderData.custom.customData)), b, to_rl(TEXT))
+			draw_custom((^Custom)(cmd.renderData.custom.customData)^, b, to_rl(TEXT))
 		case .ScissorStart:
 			rl.BeginScissorMode(i32(b.x), i32(b.y), i32(b.width), i32(b.height))
 		case .ScissorEnd:
